@@ -1,0 +1,62 @@
+name: downloads
+
+networks:
+  vpn-net:
+    name: vpn-net
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    restart: unless-stopped
+    networks:
+      - vpn-net
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "XXXX:XXXX"      # qBittorrent Web UI
+      - "YYYY:YYYY"      # qBittorrent TCP
+      - "YYYY:YYYY/udp"  # qBittorrent UDP
+    volumes:
+      - <path_to_gluetun_config_on_host>:/gluetun
+    environment:
+      - HTTP_CONTROL_SERVER_AUTH_DEFAULT_ROLE={"auth":"apikey","apikey":"${GLUETUN_API_KEY}"}
+      # THE REST OF ENV VARS SHOULD REFLECT YOUR OWN VPN CONFIG, IT'S BETTER TO REFER TO OTHER SOURCES, THIS FILE IS JUST AN EXAMPLE
+
+  # Torrent Client (routes through Gluetun)
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      # THE ENV VARS SHOULD REFLECT YOUR OWN QBITTORRENT CONFIG, IT'S BETTER TO REFER TO OTHER SOURCES, THIS FILE IS JUST AN EXAMPLE
+    volumes:
+      - <path_to_qbittorrent_config_on_host>:/config
+      - <path_to_download_folder_on_host>:/data/downloads
+
+  # VPN Watchdog: keeps port forwarding and qBittorrent in sync
+  gluetun-qbt-watchdog:
+    build: ./gluetun-qbt-watchdog
+    container_name: gluetun-qbt-watchdog
+    restart: unless-stopped
+    networks:
+      - vpn-net
+    depends_on:
+      - gluetun
+      - qbittorrent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - GLUETUN_API=http://gluetun:8000
+      - GLUETUN_API_KEY=${GLUETUN_API_KEY}
+      - QBT_API=http://gluetun:8075
+      - QBT_USER=${QBT_USER}
+      - QBT_PASS=${QBT_PASS}
+      - CHECK_INTERVAL=30
+      - HEARTBEAT_CYCLE_FREQUENCY=10
+      - TZ=<YOUR TIMEZONE>
