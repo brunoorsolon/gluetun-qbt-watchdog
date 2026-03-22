@@ -113,9 +113,11 @@ gluetun-qbt-watchdog:
   environment:
     - GLUETUN_API=http://gluetun:8000
     - GLUETUN_API_KEY=${GLUETUN_API_KEY}
+    - GLUETUN_CONTAINER_NAME=gluetun
     - QBT_API=http://gluetun:8075
     - QBT_USER=${QBT_USER}
     - QBT_PASS=${QBT_PASS}
+    - QBT_CONTAINER_NAME=qbittorrent
     - CHECK_INTERVAL=60
     - HEARTBEAT_EVERY=10
     - TZ=Europe/Amsterdam
@@ -135,9 +137,11 @@ All configuration is via environment variables:
 |----------|---------|-------------|
 | `GLUETUN_API` | `http://gluetun:8000` | Gluetun HTTP control server URL |
 | `GLUETUN_API_KEY` | *(required)* | API key for Gluetun control server |
+| `GLUETUN_CONTAINER_NAME` | `gluetun` | Docker container name to restart for Gluetun recovery |
 | `QBT_API` | `http://gluetun:8075` | qBittorrent Web UI URL |
 | `QBT_USER` | `admin` | qBittorrent username |
 | `QBT_PASS` | *(required)* | qBittorrent password |
+| `QBT_CONTAINER_NAME` | `qbittorrent` | Docker container name to restart for qBittorrent recovery |
 | `CHECK_INTERVAL` | `60` | Seconds between checks |
 | `HEARTBEAT_EVERY` | `10` | Log an "OK" message every N checks |
 | `MAX_RESTART_WAIT` | `120` | Max seconds to wait for port after container restart |
@@ -158,7 +162,7 @@ Port missing?
   │           qBittorrent and other containers keep their network.
   │
   ├─→ Step 2: If still no port after 15s — full container restart
-  │           docker restart gluetun qbittorrent mousehole
+  │           docker restart $GLUETUN_CONTAINER_NAME $QBT_CONTAINER_NAME $ADDITIONAL_RESTART
   │           This is the nuclear option, only used when the API restart fails.
   │
   └─→ Step 3: If still no port after MAX_RESTART_WAIT — give up, retry next cycle
@@ -185,14 +189,14 @@ Every cycle, the watchdog compares Gluetun's forwarded port with qBittorrent's `
 ┌─────────────────────────────────────────────────────┐
 │ vpn-net (Docker bridge network)                     │
 │                                                     │
-│  ┌──────────┐   ┌──────────────┐   ┌────────────┐  │
-│  │ gluetun  │   │ qbittorrent  │   │ watchdog   │  │
-│  │ :8000 API│   │ :8075 WebUI  │   │            │  │
-│  │ :8075 ←──┼───┤ (shares net) │   │ curl → API │  │
-│  └──────────┘   └──────────────┘   └────────────┘  │
-│       │              network_mode:                   │
-│       │              service:gluetun                  │
-└───────┼──────────────────────────────────────────────┘
+│  ┌───────────┐   ┌──────────────┐   ┌────────────┐  │
+│  │ gluetun   │   │ qbittorrent  │   │ watchdog   │  │
+│  │ :8000 API │   │ :8080 WebUI  │   │            │  │
+│  │ :8080 ←── ┼───┤ (shares net) │   │ curl → API │  │
+│  └───────────┘   └──────────────┘   └────────────┘  │
+│       │              network_mode:                  │
+│       │              service:gluetun                │
+└───────┼─────────────────────────────────────────────┘
         │
    VPN tunnel → ProtonVPN → NAT-PMP port forwarding
 ```
@@ -206,6 +210,21 @@ If your qBittorrent password contains special characters (`%`, `&`, `+`, etc.), 
 ```env
 QBT_PASS=my%weird&password
 ```
+
+## qBittorrent Password Recovery
+
+If the watchdog cannot log in to qBittorrent with `QBT_PASS`, it will try to recover automatically:
+
+1. Read the temporary password from the qBittorrent container logs
+2. Log in with that temporary password
+3. Update qBittorrent's Web UI password to the `QBT_PASS` value from your `.env`
+4. Retry the normal login and continue the sync loop
+
+This is especially helpful on first startup with `linuxserver/qbittorrent`, where qBittorrent may generate a one-time temporary password before you've set your own.
+
+Because of this recovery path, the watchdog needs access to the Docker socket not only for last-resort container restarts, but also to read qBittorrent logs during password recovery.
+
+If recovery fails, the watchdog logs a warning and skips that cycle instead of changing anything blindly.
 
 ## Adapting for Other Torrent Clients
 

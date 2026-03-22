@@ -2,15 +2,18 @@
 # gluetun-qbt-watchdog
 # Single script that keeps gluetun port forwarding and qBittorrent in sync.
 
+GLUETUN_CONTAINER_NAME="${GLUETUN_CONTAINER_NAME:-gluetun}"
 GLUETUN_API="${GLUETUN_API:-http://gluetun:8000}"
 GLUETUN_API_KEY="${GLUETUN_API_KEY:-}"
 QBT_API="${QBT_API:-http://gluetun:8075}"
 QBT_USER="${QBT_USER:-admin}"
 QBT_PASS="${QBT_PASS:-}"
+QBT_CONTAINER_NAME="${QBT_CONTAINER_NAME:-qbittorrent}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-30}"
 HEARTBEAT_CYCLE_FREQUENCY="${HEARTBEAT_CYCLE_FREQUENCY:-10}"
 MAX_RESTART_WAIT="${MAX_RESTART_WAIT:-30}"
 QBT_COOKIE="/tmp/qbt_cookies.txt"
+ADDITIONAL_RESTART="${ADDITIONAL_RESTART:-''}"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1"
@@ -36,11 +39,17 @@ restart_vpn() {
 }
 
 # ---- qBittorrent helpers ----
-qbt_login() {
+# Login helper that can try either the configured password or a temporary one recovered from logs.
+qbt_login_with_password() {
+    local password="$1"
     local result=$(curl -sf -c "$QBT_COOKIE" \
-        --data-urlencode "username=$QBT_USER" --data-urlencode "password=$QBT_PASS" \
+        --data-urlencode "username=$QBT_USER" --data-urlencode "password=$password" \
         "$QBT_API/api/v2/auth/login")
     [ "$result" = "Ok." ]
+}
+
+qbt_login() {
+    qbt_login_with_password "$QBT_PASS"
 }
 
 get_qbt_port() {
@@ -55,12 +64,63 @@ set_qbt_port() {
         "$QBT_API/api/v2/app/setPreferences" > /dev/null
 }
 
+# Updates the Web UI password to the configured QBT_PASS value.
+set_qbt_password() {
+    local escaped_password=$(printf '%s' "$QBT_PASS" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    curl -sf -b "$QBT_COOKIE" \
+        --data-urlencode "json={\"web_ui_password\":\"$escaped_password\"}" \
+        "$QBT_API/api/v2/app/setPreferences" > /dev/null
+}
+
+# Reads the temporary password that qBittorrent prints to container logs.
+get_qbt_init_password() {
+    docker logs --tail 200 "$QBT_CONTAINER_NAME" 2>&1 | \
+        sed -n 's/.*A temporary password is provided for this session: //p' | \
+        tail -1 | tr -d '\r'
+}
+
+# If the configured password fails, use the temporary password from logs and replace it.
+recover_qbt_password() {
+    if [ -z "$QBT_PASS" ]; then
+        log "ERROR: QBT_PASS is empty, cannot recover qBittorrent login."
+        return 1
+    fi
+
+    log "WARNING: qBittorrent login failed with configured password. Checking container logs for the temporary password..."
+    local init_password=$(get_qbt_init_password)
+    if [ -z "$init_password" ]; then
+        log "ERROR: Could not extract qBittorrent temporary password from container logs."
+        return 1
+    fi
+
+    if ! qbt_login_with_password "$init_password"; then
+        log "ERROR: Temporary qBittorrent password from container logs ($init_password) did not work."
+        return 1
+    fi
+
+    log "Updating qBittorrent Web UI password from temporary password to configured QBT_PASS."
+    if ! set_qbt_password; then
+        log "ERROR: Failed to update qBittorrent Web UI password."
+        return 1
+    fi
+
+    sleep 2
+
+    if qbt_login; then
+        log "qBittorrent Web UI password updated successfully."
+        return 0
+    fi
+
+    log "ERROR: Updated qBittorrent password, but login with configured QBT_PASS still failed."
+    return 1
+}
+
 # ---- Recovery helpers ----
 restart_via_docker() {
-    log "Restarting gluetun container via Docker..."
-    docker restart gluetun
+    log "Restarting containers via Docker: $GLUETUN_CONTAINER_NAME $QBT_CONTAINER_NAME"
+    docker restart "$GLUETUN_CONTAINER_NAME"
     sleep 10
-    docker restart qbittorrent mousehole 2>/dev/null
+    docker restart "$QBT_CONTAINER_NAME" "$ADDITIONAL_RESTART" 2>/dev/null
 }
 
 wait_for_port() {
@@ -114,9 +174,11 @@ while true; do
 
     # Step 2: Login to qBittorrent
     if ! qbt_login; then
-        log "WARNING: Can't login to qBittorrent. Skipping this cycle."
-        sleep "$CHECK_INTERVAL"
-        continue
+        if ! recover_qbt_password; then
+            log "WARNING: Can't login to qBittorrent. Skipping this cycle."
+            sleep "$CHECK_INTERVAL"
+            continue
+        fi
     fi
 
     # Step 3: Check if qBittorrent has the right port
