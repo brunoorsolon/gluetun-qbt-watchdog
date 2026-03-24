@@ -7,7 +7,7 @@ networks:
 services:
   gluetun:
     image: qmcgaw/gluetun:latest
-    container_name: gluetun
+    container_name: gluetun # value of GLUETUN_CONTAINER_NAME
     restart: unless-stopped
     networks:
       - vpn-net
@@ -16,9 +16,9 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "XXXX:XXXX"      # qBittorrent Web UI
-      - "YYYY:YYYY"      # qBittorrent TCP
-      - "YYYY:YYYY/udp"  # qBittorrent UDP
+      - "${QBT_WEBUI_PORT:-8080}:${QBT_WEBUI_PORT:-8080}"                # qBittorrent Web UI
+      - "${QBT_TORRENTING_PORT:-6881}:${QBT_TORRENTING_PORT:-6881}"      # qBittorrent TCP
+      - "${QBT_TORRENTING_PORT:-6881}:${QBT_TORRENTING_PORT:-6881}/udp"  # qBittorrent UDP
     volumes:
       - <path_to_gluetun_config_on_host>:/gluetun
     environment:
@@ -28,16 +28,18 @@ services:
   # Torrent Client (routes through Gluetun)
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:latest
-    container_name: qbittorrent
+    container_name: qbittorrent # value of QBT_CONTAINER_NAME
     restart: unless-stopped
     network_mode: "service:gluetun"
     depends_on:
       - gluetun
     environment:
       # THE ENV VARS SHOULD REFLECT YOUR OWN QBITTORRENT CONFIG, IT'S BETTER TO REFER TO OTHER SOURCES, THIS FILE IS JUST AN EXAMPLE
+      WEBUI_PORT: "${QBT_WEBUI_PORT:-8080}"
+      TORRENTING_PORT: "${QBT_TORRENTING_PORT:-6881}"
     volumes:
       - <path_to_qbittorrent_config_on_host>:/config
-      - <path_to_download_folder_on_host>:/data/downloads
+      - <path_to_download_folder_on_host>:/downloads
 
   # VPN Watchdog: keeps port forwarding and qBittorrent in sync
   gluetun-qbt-watchdog:
@@ -47,16 +49,18 @@ services:
     networks:
       - vpn-net
     depends_on:
-      - gluetun
-      - qbittorrent
+      - gluetun # value of GLUETUN_CONTAINER_NAME
+      - qbittorrent # value of QBT_CONTAINER_NAME
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      - GLUETUN_API=http://gluetun:8000
+      - GLUETUN_CONTAINER_NAME=${GLUETUN_CONTAINER_NAME:-gluetun}
+      - GLUETUN_API=http://${GLUETUN_CONTAINER_NAME:-gluetun}:${GLUETUN_API_PORT:-8000}
       - GLUETUN_API_KEY=${GLUETUN_API_KEY}
-      - QBT_API=http://gluetun:8075
-      - QBT_USER=${QBT_USER}
+      - QBT_CONTAINER_NAME=${QBT_CONTAINER_NAME:-qbittorrent}
+      - QBT_API=http://${GLUETUN_CONTAINER_NAME:-gluetun}:${QBT_WEBUI_PORT:-8080}
+      - QBT_USER=${QBT_USER:-admin}
       - QBT_PASS=${QBT_PASS}
-      - CHECK_INTERVAL=30
-      - HEARTBEAT_CYCLE_FREQUENCY=10
-      - TZ=<YOUR TIMEZONE>
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-30}
+      - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
+      - MAX_RESTART_WAIT="${MAX_RESTART_WAIT:-30}"
