@@ -143,7 +143,7 @@ All configuration is via environment variables:
 | `QBT_PASS` | *(required)* | qBittorrent password |
 | `QBT_CONTAINER_NAME` | `qbittorrent` | Docker container name to restart for qBittorrent recovery |
 | `CHECK_INTERVAL` | `60` | Seconds between checks |
-| `HEARTBEAT_EVERY` | `10` | Log an "OK" message every N checks |
+| `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an "OK" message every N checks |
 | `MAX_RESTART_WAIT` | `120` | Max seconds to wait for port after container restart |
 
 > **Tip:** `CHECK_INTERVAL=60` with `HEARTBEAT_EVERY=10` gives you an "OK" log every 10 minutes. Adjust to your preference.
