@@ -119,7 +119,7 @@ gluetun-qbt-watchdog:
     - QBT_PASS=${QBT_PASS}
     - QBT_CONTAINER_NAME=qbittorrent
     - CHECK_INTERVAL=60
-    - HEARTBEAT_EVERY=10
+    - HEARTBEAT_CYCLE_FREQUENCY=10
     - TZ=Europe/Amsterdam
 ```
 
@@ -145,8 +145,10 @@ All configuration is via environment variables:
 | `CHECK_INTERVAL` | `60` | Seconds between checks |
 | `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an "OK" message every N checks |
 | `MAX_RESTART_WAIT` | `120` | Max seconds to wait for port after container restart |
+| `GLUETUN_API_PORT` | `8000` | Gluetun HTTP control server port (used to build `GLUETUN_API` in docker-compose) |
+| `ADDITIONAL_RESTART` | *(empty)* | Extra container name(s) to restart alongside Gluetun and qBittorrent during last-resort recovery |
 
-> **Tip:** `CHECK_INTERVAL=60` with `HEARTBEAT_EVERY=10` gives you an "OK" log every 10 minutes. Adjust to your preference.
+> **Tip:** `CHECK_INTERVAL=60` with `HEARTBEAT_CYCLE_FREQUENCY=10` gives you an "OK" log every 10 minutes. Adjust to your preference.
 
 ## How It Works
 
