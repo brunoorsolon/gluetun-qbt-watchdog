@@ -42,10 +42,9 @@ restart_vpn() {
 # Login helper that can try either the configured password or a temporary one recovered from logs.
 qbt_login_with_password() {
     local password="$1"
-    local result=$(curl -sf -c "$QBT_COOKIE" \
+    curl -sf -c "$QBT_COOKIE" \
         --data-urlencode "username=$QBT_USER" --data-urlencode "password=$password" \
-        "$QBT_API/api/v2/auth/login")
-    [ "$result" = "Ok." ]
+        "$QBT_API/api/v2/auth/login" > /dev/null
 }
 
 qbt_login() {
