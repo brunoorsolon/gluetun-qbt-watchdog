@@ -43,7 +43,9 @@ services:
 
   # VPN Watchdog: keeps port forwarding and qBittorrent in sync
   gluetun-qbt-watchdog:
-    build: ./gluetun-qbt-watchdog
+    image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:latest
+    # For local development, replace the image line with:
+    # build: ./gluetun-qbt-watchdog
     container_name: gluetun-qbt-watchdog
     restart: unless-stopped
     networks:
@@ -52,6 +54,7 @@ services:
       - gluetun # value of GLUETUN_CONTAINER_NAME
       - qbittorrent # value of QBT_CONTAINER_NAME
     volumes:
+      # Required for last-resort container restarts and legacy qBittorrent password recovery.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - GLUETUN_CONTAINER_NAME=${GLUETUN_CONTAINER_NAME:-gluetun}
@@ -59,8 +62,11 @@ services:
       - GLUETUN_API_KEY=${GLUETUN_API_KEY}
       - QBT_CONTAINER_NAME=${QBT_CONTAINER_NAME:-qbittorrent}
       - QBT_API=http://${GLUETUN_CONTAINER_NAME:-gluetun}:${QBT_WEBUI_PORT:-8080}
+      - QBT_API_KEY=${QBT_API_KEY:-}
+      - QBT_AUTH_MODE=${QBT_AUTH_MODE:-auto}
       - QBT_USER=${QBT_USER:-admin}
-      - QBT_PASS=${QBT_PASS}
+      - QBT_PASS=${QBT_PASS:-}
       - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
       - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
-      - MAX_RESTART_WAIT="${MAX_RESTART_WAIT:-120}"
+      - MAX_RESTART_WAIT=${MAX_RESTART_WAIT:-120}
+      - ADDITIONAL_RESTART=${ADDITIONAL_RESTART:-}

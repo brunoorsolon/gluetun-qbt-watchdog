@@ -5,7 +5,9 @@
 GLUETUN_CONTAINER_NAME="${GLUETUN_CONTAINER_NAME:-gluetun}"
 GLUETUN_API="${GLUETUN_API:-http://gluetun:8000}"
 GLUETUN_API_KEY="${GLUETUN_API_KEY:-}"
-QBT_API="${QBT_API:-http://gluetun:8075}"
+QBT_API="${QBT_API:-http://gluetun:8080}"
+QBT_API_KEY="${QBT_API_KEY:-}"
+QBT_AUTH_MODE="${QBT_AUTH_MODE:-auto}"
 QBT_USER="${QBT_USER:-admin}"
 QBT_PASS="${QBT_PASS:-}"
 QBT_CONTAINER_NAME="${QBT_CONTAINER_NAME:-qbittorrent}"
@@ -13,7 +15,8 @@ CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
 HEARTBEAT_CYCLE_FREQUENCY="${HEARTBEAT_CYCLE_FREQUENCY:-10}"
 MAX_RESTART_WAIT="${MAX_RESTART_WAIT:-120}"
 QBT_COOKIE="/tmp/qbt_cookies.txt"
-ADDITIONAL_RESTART="${ADDITIONAL_RESTART:-''}"
+QBT_LOGIN_RESPONSE="/tmp/qbt_login_response.txt"
+ADDITIONAL_RESTART="${ADDITIONAL_RESTART:-}"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1"
@@ -39,28 +42,110 @@ restart_vpn() {
 }
 
 # ---- qBittorrent helpers ----
+validate_qbt_auth_mode() {
+    case "$QBT_AUTH_MODE" in
+        auto|apikey|password) return 0 ;;
+        *)
+            log "ERROR: Invalid QBT_AUTH_MODE '$QBT_AUTH_MODE'. Use auto, apikey, or password."
+            return 1
+            ;;
+    esac
+}
+
+qbt_uses_api_key() {
+    [ "$QBT_AUTH_MODE" = "apikey" ] || \
+        { [ "$QBT_AUTH_MODE" = "auto" ] && [ -n "$QBT_API_KEY" ]; }
+}
+
+qbt_auth_description() {
+    if qbt_uses_api_key; then
+        echo "api key"
+    else
+        echo "username/password"
+    fi
+}
+
+qbt_curl() {
+    if qbt_uses_api_key; then
+        curl -sf -H "Authorization: Bearer $QBT_API_KEY" "$@"
+    else
+        curl -sf -b "$QBT_COOKIE" "$@"
+    fi
+}
+
+qbt_check_api_key() {
+    if [ -z "$QBT_API_KEY" ]; then
+        log "ERROR: QBT_AUTH_MODE=apikey requires QBT_API_KEY."
+        return 1
+    fi
+
+    local status
+    status=$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $QBT_API_KEY" \
+        "$QBT_API/api/v2/app/webapiVersion")
+
+    case "$status" in
+        200) return 0 ;;
+        401|403) log "ERROR: qBittorrent API key was rejected." ;;
+        404) log "ERROR: qBittorrent WebAPI endpoint not found; API-key auth requires qBittorrent 5.2.0 / WebAPI 2.14.1+." ;;
+        000) log "WARNING: qBittorrent WebAPI is unreachable." ;;
+        *) log "ERROR: qBittorrent API-key probe failed with HTTP $status." ;;
+    esac
+    return 1
+}
+
 # Login helper that can try either the configured password or a temporary one recovered from logs.
 qbt_login_with_password() {
     local password="$1"
-    local result=$(curl -sf -c "$QBT_COOKIE" \
+    local status
+    local result
+
+    status=$(curl -s -o "$QBT_LOGIN_RESPONSE" -w '%{http_code}' -c "$QBT_COOKIE" \
         --data-urlencode "username=$QBT_USER" --data-urlencode "password=$password" \
         "$QBT_API/api/v2/auth/login")
-    [ "$result" = "Ok." ]
+    result=$(tr -d '\r' < "$QBT_LOGIN_RESPONSE")
+
+    if [ "$status" = "204" ]; then
+        return 0
+    fi
+
+    if [ "$status" = "200" ] && [ "$result" = "Ok." ]; then
+        return 0
+    fi
+
+    case "$status" in
+        401) log "ERROR: qBittorrent login failed: invalid credentials." ;;
+        000) log "WARNING: qBittorrent WebAPI is unreachable." ;;
+        *) log "ERROR: qBittorrent login failed with HTTP $status." ;;
+    esac
+    return 1
 }
 
 qbt_login() {
     qbt_login_with_password "$QBT_PASS"
 }
 
+qbt_authenticate() {
+    if qbt_uses_api_key; then
+        qbt_check_api_key
+        return $?
+    fi
+
+    if qbt_login; then
+        return 0
+    fi
+
+    recover_qbt_password
+}
+
 get_qbt_port() {
-    curl -sf -b "$QBT_COOKIE" \
-        "$QBT_API/api/v2/app/preferences" | \
-        grep -o '"listen_port":[0-9]*' | head -1 | grep -o '[0-9]*'
+    qbt_curl "$QBT_API/api/v2/app/preferences" | \
+        grep -o '"listen_port"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | grep -o '[0-9]*'
 }
 
 set_qbt_port() {
-    curl -sf -b "$QBT_COOKIE" \
-        -d "json={\"listen_port\":$1,\"random_port\":false,\"upnp\":false}" \
+    qbt_curl \
+        --data-urlencode "json={\"listen_port\":$1,\"random_port\":false,\"upnp\":false}" \
         "$QBT_API/api/v2/app/setPreferences" > /dev/null
 }
 
@@ -94,7 +179,7 @@ recover_qbt_password() {
     fi
 
     if ! qbt_login_with_password "$init_password"; then
-        log "ERROR: Temporary qBittorrent password from container logs ($init_password) did not work."
+        log "ERROR: Temporary qBittorrent password from container logs did not work."
         return 1
     fi
 
@@ -117,10 +202,14 @@ recover_qbt_password() {
 
 # ---- Recovery helpers ----
 restart_via_docker() {
-    log "Restarting containers via Docker: $GLUETUN_CONTAINER_NAME $QBT_CONTAINER_NAME"
+    log "Restarting containers via Docker: $GLUETUN_CONTAINER_NAME $QBT_CONTAINER_NAME${ADDITIONAL_RESTART:+ $ADDITIONAL_RESTART}"
     docker restart "$GLUETUN_CONTAINER_NAME"
     sleep 10
-    docker restart "$QBT_CONTAINER_NAME" "$ADDITIONAL_RESTART" 2>/dev/null
+    docker restart "$QBT_CONTAINER_NAME"
+
+    for container in $ADDITIONAL_RESTART; do
+        docker restart "$container" 2>/dev/null
+    done
 }
 
 wait_for_port() {
@@ -141,6 +230,10 @@ wait_for_port() {
 log "Watchdog started. Checking every ${CHECK_INTERVAL}s, heartbeat every ${HEARTBEAT_CYCLE_FREQUENCY} cycles"
 log "Gluetun API: $GLUETUN_API"
 log "qBittorrent API: $QBT_API"
+if ! validate_qbt_auth_mode; then
+    exit 1
+fi
+log "qBittorrent auth mode: $(qbt_auth_description)"
 
 # Initial delay to let everything start up
 sleep 30
@@ -172,13 +265,11 @@ while true; do
         log "New port after recovery: $GLUETUN_PORT"
     fi
 
-    # Step 2: Login to qBittorrent
-    if ! qbt_login; then
-        if ! recover_qbt_password; then
-            log "WARNING: Can't login to qBittorrent. Skipping this cycle."
-            sleep "$CHECK_INTERVAL"
-            continue
-        fi
+    # Step 2: Authenticate to qBittorrent
+    if ! qbt_authenticate; then
+        log "WARNING: Can't authenticate to qBittorrent. Skipping this cycle."
+        sleep "$CHECK_INTERVAL"
+        continue
     fi
 
     # Step 3: Check if qBittorrent has the right port
