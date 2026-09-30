@@ -12,6 +12,7 @@ QBT_USER="${QBT_USER:-admin}"
 QBT_PASS="${QBT_PASS:-}"
 QBT_CONTAINER_NAME="${QBT_CONTAINER_NAME:-qbittorrent}"
 CHECK_INTERVAL="${CHECK_INTERVAL:-60}"
+PORT_MISS_THRESHOLD="${PORT_MISS_THRESHOLD:-3}"
 HEARTBEAT_CYCLE_FREQUENCY="${HEARTBEAT_CYCLE_FREQUENCY:-10}"
 MAX_RESTART_WAIT="${MAX_RESTART_WAIT:-120}"
 QBT_COOKIE="/tmp/qbt_cookies.txt"
@@ -203,12 +204,12 @@ recover_qbt_password() {
 # ---- Recovery helpers ----
 restart_via_docker() {
     log "Restarting containers via Docker: $GLUETUN_CONTAINER_NAME $QBT_CONTAINER_NAME${ADDITIONAL_RESTART:+ $ADDITIONAL_RESTART}"
-    docker restart "$GLUETUN_CONTAINER_NAME"
+    docker restart "$GLUETUN_CONTAINER_NAME" || log "ERROR: docker restart $GLUETUN_CONTAINER_NAME failed"
     sleep 10
-    docker restart "$QBT_CONTAINER_NAME"
+    docker restart "$QBT_CONTAINER_NAME" || log "ERROR: docker restart $QBT_CONTAINER_NAME failed"
 
     for container in $ADDITIONAL_RESTART; do
-        docker restart "$container" 2>/dev/null
+        docker restart "$container" || log "ERROR: docker restart $container failed"
     done
 }
 
@@ -239,6 +240,7 @@ log "qBittorrent auth mode: $(qbt_auth_description)"
 sleep 30
 
 cycle_count=0
+port_miss_count=0
 
 while true; do
     cycle_count=$((cycle_count + 1))
@@ -247,8 +249,15 @@ while true; do
     GLUETUN_PORT=$(get_gluetun_port)
 
     if [ -z "$GLUETUN_PORT" ] || [ "$GLUETUN_PORT" = "0" ]; then
+        port_miss_count=$((port_miss_count + 1))
+        if [ "$port_miss_count" -lt "$PORT_MISS_THRESHOLD" ]; then
+            log "WARNING: No forwarded port from gluetun ($port_miss_count/$PORT_MISS_THRESHOLD), waiting for gluetun to retry"
+            sleep "$CHECK_INTERVAL"
+            continue
+        fi
         log "WARNING: No forwarded port from gluetun. Attempting VPN restart..."
         restart_vpn
+        port_miss_count=0
         sleep 15
         GLUETUN_PORT=$(get_gluetun_port)
 
@@ -264,6 +273,8 @@ while true; do
         fi
         log "New port after recovery: $GLUETUN_PORT"
     fi
+
+    port_miss_count=0
 
     # Step 2: Authenticate to qBittorrent
     if ! qbt_authenticate; then

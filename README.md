@@ -23,7 +23,7 @@ Related Gluetun issues:
 Every cycle, the watchdog:
 
 1. Reads Gluetun's forwarded port from the HTTP control API.
-2. Recovers missing ports by restarting the VPN through Gluetun's API, then restarting containers only as a last resort.
+2. Waits for `PORT_MISS_THRESHOLD` consecutive checks with no port before restarting the VPN through Gluetun's API, then restarting containers only as a last resort.
 3. Authenticates to qBittorrent using either API-key auth or legacy username/password auth.
 4. Updates qBittorrent's `listen_port` when it differs from Gluetun's forwarded port.
 5. Logs periodic heartbeats so you know it is alive.
@@ -111,6 +111,7 @@ gluetun-qbt-watchdog:
     - QBT_USER=${QBT_USER:-admin}
     - QBT_PASS=${QBT_PASS:-}
     - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+    - PORT_MISS_THRESHOLD=${PORT_MISS_THRESHOLD:-3}
     - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
     - MAX_RESTART_WAIT=${MAX_RESTART_WAIT:-120}
     - ADDITIONAL_RESTART=${ADDITIONAL_RESTART:-}
@@ -144,6 +145,7 @@ image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.0
 | `QBT_USER` | `admin` | qBittorrent username for legacy password auth. |
 | `QBT_PASS` | empty | qBittorrent password for legacy password auth and first-start recovery. |
 | `CHECK_INTERVAL` | `60` | Seconds between sync cycles. |
+| `PORT_MISS_THRESHOLD` | `3` | Consecutive checks with no forwarded port before recovery; resets on a valid port or after a recovery attempt. With `CHECK_INTERVAL=60`, gives Gluetun 2–3 minutes to recover on its own. |
 | `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an OK heartbeat every N successful cycles. |
 | `MAX_RESTART_WAIT` | `120` | Seconds to wait for a forwarded port after full restart. |
 | `ADDITIONAL_RESTART` | empty | Optional space-separated container names to restart after Gluetun/qBittorrent. |
@@ -179,7 +181,7 @@ Password recovery is not used in API-key mode. If you are setting up a new qBitt
 
 ## Recovery Behavior
 
-When Gluetun has no forwarded port:
+When Gluetun has no forwarded port, log a warning, skip qBittorrent, and wait `CHECK_INTERVAL` seconds between checks until `PORT_MISS_THRESHOLD` consecutive misses trigger recovery:
 
 1. Restart the VPN through Gluetun's HTTP API.
 2. Wait briefly and check the forwarded port again.
@@ -215,6 +217,8 @@ The watchdog mounts `/var/run/docker.sock` so it can:
 - read qBittorrent logs for legacy password recovery
 
 Docker socket access allows container control from inside the watchdog container. Only run this in an environment where you trust the image and Compose configuration.
+
+If you run the watchdog with a non-root `user:`, add the socket's group with `group_add` (find it with `stat -c %g /var/run/docker.sock`), or the restart fallback fails with permission denied.
 
 ## What You Can Remove
 
