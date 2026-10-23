@@ -189,11 +189,35 @@ class WatchdogTests(unittest.TestCase):
     def test_malformed_and_out_of_range_ports_cannot_trigger_recovery(self):
         bodies = ["", "not json", '{}', '{"port":null}', '{"port":-1}', '{"port":65536}',
                   '{"port":01}', '{"port":"1234"}', '{"port":0} trailing',
-                  '{"port":0,"error":"failure"}', '{"port":1,"port":0}']
+                  '{"port":0,"error":"failure"}', '{"port":1,"port":0}',
+                  '{"port":true}', '{"port":33061.0}', '{"ports":[33061]}', '[33061]']
         state, _ = self.run_watchdog([{"body": body} for body in bodies])
         self.assertEqual(self.events(state, "stopped"), [])
         self.assertEqual(self.events(state, "sync"), [])
         self.assertEqual(self.events(state, "docker"), [])
+
+    def test_gluetun_ports_array_does_not_block_primary_port_sync(self):
+        state, log = self.run_watchdog([
+            {"body": '{"port":0,"ports":[]}'},
+            {"body": '{"port":33061,"ports":[33061]}'},
+            {"body": '{"ports":[33062],"port":33062}'},
+        ])
+        self.assertEqual(self.events(state, "sync"), [[90, 33061], [152, 33062]])
+        self.assertEqual(self.events(state, "stopped"), [])
+        self.assertEqual(self.restarts(state), [])
+        self.assertEqual(state["health"][:2], ["healthy", "ports_synced"])
+        self.assertNotIn("Invalid Gluetun port response", log)
+
+    def test_current_gluetun_response_clears_persisted_terminal_state(self):
+        with tempfile.TemporaryDirectory(prefix="watchdog-port-format-") as directory:
+            root = Path(directory)
+            state, log = self.run_watchdog([{"body": "invalid"}] * 8, root)
+            self.assertEqual(state["health"][:2], ["unrecoverable", "gluetun_response_invalid"])
+            state, log = self.run_watchdog([{"body": '{"port":33061,"ports":[33061]}'}], root)
+            self.assertEqual(state["health"][:2], ["healthy", "ports_synced"])
+            self.assertEqual(self.events(state, "stopped"), [])
+            self.assertEqual(log.count("INFO RECOVERED:"), 1)
+            self.assertNotIn("UNRECOVERABLE", log)
 
     def test_valid_port_resets_missing_timer_and_count(self):
         state, _ = self.run_watchdog([{}] * 5 + [{"port": 54128}] + [{}] * 6)
