@@ -23,19 +23,18 @@ Related Gluetun issues:
 Every cycle, the watchdog:
 
 1. Reads Gluetun's forwarded port from the HTTP control API.
-2. Waits for `PORT_MISS_THRESHOLD` consecutive checks with no port before restarting the VPN through Gluetun's API, then restarting containers only as a last resort.
+2. Requires a configurable number of confirmed missing-port checks and elapsed grace time before bounded Gluetun-only recovery. qBittorrent and other containers are never restarted or stopped.
 3. Authenticates to qBittorrent using either API-key auth or legacy username/password auth.
 4. Updates qBittorrent's `listen_port` when it differs from Gluetun's forwarded port.
-5. Logs periodic heartbeats so you know it is alive.
+5. Exposes `/healthz` for Uptime Kuma. Exhausted recovery produces one `ERROR UNRECOVERABLE` event per outage, not a stream of alerts.
 
 Example logs:
 
 ```text
-2026-03-19 09:29:04 WARNING: Port mismatch: gluetun=47830, qbt=34987. Fixing...
-2026-03-19 09:29:07 Port synced successfully: 47830
-2026-03-19 09:34:14 OK: gluetun=47830, qbt=47830
-2026-03-19 15:01:45 WARNING: No forwarded port from gluetun. Attempting VPN restart...
-2026-03-19 15:02:03 New port after recovery: 52194
+2026-03-19 09:29:04 INFO: Port mismatch: gluetun=47830, qbt=34987. Updating qBittorrent.
+2026-03-19 09:29:06 INFO: Port synced successfully: 47830
+2026-03-19 15:40:10 ERROR UNRECOVERABLE: port_missing_after_recovery; automatic restarts disabled; monitoring and port sync continue.
+2026-03-19 16:00:12 INFO RECOVERED: Gluetun port 52194 is confirmed and qBittorrent matches; recovery budget rearmed.
 ```
 
 ## Quick Start
@@ -100,6 +99,9 @@ gluetun-qbt-watchdog:
     - qbittorrent
   volumes:
     - /var/run/docker.sock:/var/run/docker.sock
+    - watchdog-state:/state
+  # For Kuma on the host rather than vpn-net, optionally publish on loopback:
+  # ports: ["127.0.0.1:8081:8081"]
   environment:
     - GLUETUN_CONTAINER_NAME=${GLUETUN_CONTAINER_NAME:-gluetun}
     - GLUETUN_API=http://${GLUETUN_CONTAINER_NAME:-gluetun}:${GLUETUN_API_PORT:-8000}
@@ -112,12 +114,25 @@ gluetun-qbt-watchdog:
     - QBT_PASS=${QBT_PASS:-}
     - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
     - PORT_MISS_THRESHOLD=${PORT_MISS_THRESHOLD:-3}
+    - MISSING_PORT_GRACE=${MISSING_PORT_GRACE:-300}
+    - GLUETUN_RECOVERY_GRACE=${GLUETUN_RECOVERY_GRACE:-300}
+    - RESTART_COOLDOWN=${RESTART_COOLDOWN:-900}
+    - MAX_VPN_RESTARTS=${MAX_VPN_RESTARTS:-2}
+    - RESTART_GLUETUN_CONTAINER=${RESTART_GLUETUN_CONTAINER:-true}
+    - STATE_DIR=/state
+    - HEALTH_BIND=0.0.0.0
+    - HEALTH_PORT=${HEALTH_PORT:-8081}
     - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
-    - MAX_RESTART_WAIT=${MAX_RESTART_WAIT:-120}
-    - ADDITIONAL_RESTART=${ADDITIONAL_RESTART:-}
 ```
 
-A complete example is available in [`docker-compose.yml.example`](docker-compose.yml.example).
+Declare the named volume at the Compose file's top level:
+
+```yaml
+volumes:
+  watchdog-state:
+```
+
+A complete example is available in [`docker-compose.yml.example`](docker-compose.yml.example). The persistent volume is essential: without it, recreating the watchdog loses its recovery budget and alert latch.
 
 ### 5. Pull the image
 
@@ -128,7 +143,7 @@ docker pull ghcr.io/brunoorsolon/gluetun-qbt-watchdog:latest
 You can also pin a release tag once releases are published:
 
 ```yaml
-image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.0
+image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.2
 ```
 
 ## Configuration
@@ -145,10 +160,16 @@ image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.0
 | `QBT_USER` | `admin` | qBittorrent username for legacy password auth. |
 | `QBT_PASS` | empty | qBittorrent password for legacy password auth and first-start recovery. |
 | `CHECK_INTERVAL` | `60` | Seconds between sync cycles. |
-| `PORT_MISS_THRESHOLD` | `3` | Consecutive checks with no forwarded port before recovery; resets on a valid port or after a recovery attempt. With `CHECK_INTERVAL=60`, gives Gluetun 2–3 minutes to recover on its own. |
+| `PORT_MISS_THRESHOLD` | `3` | Confirmed missing-port checks required before recovery. API errors neither increment nor reset the count; a valid port clears it. |
+| `MISSING_PORT_GRACE` | `300` (5 minutes) | Seconds from the first confirmed missing port before recovery; the miss count must also pass. Also the deadline for persistent API/auth/sync failures to become an alert without restarting anything. |
+| `GLUETUN_RECOVERY_GRACE` | `300` (5 minutes) | Seconds allowed for observed Gluetun recovery and after each watchdog restart attempt. Observed unhealthy/unknown health starts one fixed window per outage; it does not slide forward on each check. |
+| `RESTART_COOLDOWN` | `900` (15 minutes) | Minimum seconds after a completed restart attempt before another VPN or Gluetun-container restart. Success and manual reset do not clear it. |
+| `MAX_VPN_RESTARTS` | `2` | Maximum VPN API stop/start attempts per outage. Failed calls consume an attempt too. |
+| `RESTART_GLUETUN_CONTAINER` | `true` | Allow one final Gluetun-only container restart after the VPN budget is exhausted. Set `false` to use API recovery only. |
+| `STATE_DIR` | `/state` | Writable persistent directory for recovery counters, deadlines, and the alert latch. Mount a volume here; one watchdog per state volume. |
+| `HEALTH_BIND` | `0.0.0.0` | Health server bind address inside the watchdog container. Restrict exposure to your monitoring network. |
+| `HEALTH_PORT` | `8081` | HTTP port for `/healthz`. Match any Docker port mapping to this container port. |
 | `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an OK heartbeat every N successful cycles. |
-| `MAX_RESTART_WAIT` | `120` | Seconds to wait for a forwarded port after full restart. |
-| `ADDITIONAL_RESTART` | empty | Optional space-separated container names to restart after Gluetun/qBittorrent. |
 
 ## qBittorrent Authentication Modes
 
@@ -181,13 +202,63 @@ Password recovery is not used in API-key mode. If you are setting up a new qBitt
 
 ## Recovery Behavior
 
-When Gluetun has no forwarded port, log a warning, skip qBittorrent, and wait `CHECK_INTERVAL` seconds between checks until `PORT_MISS_THRESHOLD` consecutive misses trigger recovery:
+1. Keep checking every `CHECK_INTERVAL` seconds (default 60). A valid Gluetun port clears the missing-port timer/count and is synced to qBittorrent on that cycle. A mismatch is fixed through qBittorrent preferences, never by restarting containers.
+2. Only a successful API response containing `{"port":0}` counts as a missing port. Timeouts, HTTP errors (including authentication failures), malformed responses, and invalid ports preserve earlier missing-port history but never trigger restarts on that cycle. Persistent API or qBittorrent authentication/sync failures become an alert after `MISSING_PORT_GRACE`, not a reason to restart the VPN.
+3. Require both `PORT_MISS_THRESHOLD` confirmed misses and `MISSING_PORT_GRACE` elapsed seconds. Five minutes is a trial default, not a proven Proton requirement.
+4. Observe Gluetun's Docker health. Starting, unhealthy, restarting, or unknown health gets a fixed `GLUETUN_RECOVERY_GRACE` window. Repeated unhealthy checks do not extend it forever. After the window, a confirmed missing port can still justify recovery; unknown health is not itself evidence of VPN failure.
+5. Attempt up to `MAX_VPN_RESTARTS` VPN API stop/start sequences. Each attempt consumes budget before any side effect, even if its API calls fail. A failed stop still gets a start request because the stop response may have been lost. Between attempts, both the post-restart grace and `RESTART_COOLDOWN` must expire. Normal checking and syncing continue throughout those waits.
+6. If enabled, permit one final restart of **only Gluetun** after the VPN attempts fail. Allow another recovery grace window; if the port is still missing, latch `unrecoverable`. There are no further automatic restart attempts in that outage. qBittorrent and additional containers are never restarted or stopped.
+7. While latched, silently keep checking and trying to sync. A valid forwarded port **and** confirmed matching qBittorrent port produce one `INFO RECOVERED` event and rearm the budget. Merely seeing a valid Gluetun port is insufficient if qBittorrent is still failing. The cooldown survives recovery.
 
-1. Restart the VPN through Gluetun's HTTP API.
-2. Wait briefly and check the forwarded port again.
-3. If still missing, restart Gluetun and qBittorrent containers through Docker.
-4. Restart any containers listed in `ADDITIONAL_RESTART`.
-5. Give up after `MAX_RESTART_WAIT` and retry next cycle.
+For the simple “times until restart” lever, set `PORT_MISS_THRESHOLD=10` with `CHECK_INTERVAL=60`. Ten confirmed misses span roughly nine minutes from the first miss; increasing that threshold does not slow successful port syncing. Timers are checked on polling cycles, and HTTP/restart operations add their execution time.
+
+With defaults and no additional Gluetun health delays, the approximate timeline from the first missing port is: first VPN restart at 5 minutes, second at 20 minutes, one Gluetun-container restart at 35 minutes, then a terminal alert at 40 minutes. Kuma can alert sooner because `/healthz` is already returning 503 during recovery. Set its retry tolerance accordingly.
+
+**A Gluetun container restart still interrupts every app sharing its network namespace.** It can also leave dependent apps needing manual network recovery; this watchdog deliberately will not restart them. Set `RESTART_GLUETUN_CONTAINER=false` if that trade-off is unacceptable. A missing forwarded port is not a VPN leak detector.
+
+### Persistent state and manual reset
+
+Mount `watchdog-state:/state` (or your own persistent directory). Counters, cooldowns, and the terminal alert latch survive watchdog restarts/recreation. State contains no credentials and is never evaluated as shell code. Unwritable or invalid state makes the watchdog exit rather than restart Gluetun with a fresh budget; Kuma sees the endpoint disappear. For non-root execution, the mounted directory must be writable by the configured UID.
+
+Timers use Linux boot-time uptime rather than wall-clock time. After a host reboot, the budget/latch are retained and active waits start afresh because timestamps from different boots cannot be compared. Health observations cannot eliminate races with Gluetun's internal recovery between checks.
+
+After investigating an outage, explicitly rearm recovery without discarding the cooldown:
+
+```bash
+docker exec gluetun-qbt-watchdog touch /state/reset-request
+```
+
+Use your configured `STATE_DIR` if different. The next polling cycle consumes the request and starts a fresh missing-port window. Restarting the watchdog alone does **not** reset the budget. Do not delete the state volume as part of routine upgrades.
+
+### Uptime Kuma and Dozzle/Gotify
+
+Configure an HTTP monitor in Kuma:
+
+- URL on the shared Docker network: `http://gluetun-qbt-watchdog:8081/healthz`.
+- Accept **200 only**. It means both APIs were checked and the ports match. Startup, recovery, API/auth/sync failures, and the terminal state return **503** with a short JSON reason and attempt counters.
+- Poll at your preferred interval (for example 60 seconds), tolerate transient failures using Kuma's retry settings, and disable repeated/resend notifications if you want only down/up transitions. Validate the actual notification behavior with a controlled outage.
+- If checks stop updating, the endpoint returns 503 after `max(180, 3 × CHECK_INTERVAL)` seconds. If the watchdog or its HTTP server dies, the endpoint is unreachable; the main process also exits when it detects the server has died.
+- The endpoint is read-only, contains no secrets, and does not log every request. It has no reset/control API. Keep it on a trusted monitoring network; do not expose it publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
+- **Do not use this endpoint to trigger autoheal/container restarts.** It reports service health, not a command to replenish the recovery budget.
+
+Replace the existing Dozzle rule (`message contains "Still no port" || message contains "permission denied"`) with this condition, scoped to the watchdog container:
+
+```text
+message contains "UNRECOVERABLE"
+```
+
+Only entry into the terminal state emits that marker. Continuing failures, changing reasons, endpoint requests, and watchdog restarts do not resend it. Docker permission errors are captured rather than repeatedly printed; a failed container-recovery attempt eventually produces `ERROR UNRECOVERABLE: docker_permission_denied; ...`. Other reason codes distinguish missing ports, API access, qBittorrent authentication/preferences, port-update failure, and restart API failures.
+
+The latch is saved **before** the error is logged to favor at-most-once notification: a process crash in that tiny interval can lose the Dozzle event, but the persisted unhealthy state remains visible to Kuma. Successful recovery produces one `INFO RECOVERED` message. This guarantees bounded emission by the watchdog, not delivery/deduplication by the external notification services.
+
+### Upgrading from 1.0.1 to 1.0.2
+
+1. Add the persistent `/state` volume and configure the documented grace/cooldown settings. Keep `PORT_MISS_THRESHOLD` if already configured.
+2. Remove `MAX_RESTART_WAIT` and `ADDITIONAL_RESTART`; they are obsolete and ignored with a startup warning. The interim `VPN_RESTART_COOLDOWN` name is also ignored; use `RESTART_COOLDOWN` for all restart attempts.
+3. Deploy the new image and change the Dozzle condition together: 1.0.1 does not emit `UNRECOVERABLE`.
+4. Add the Kuma monitor and test a transient failure, one terminal alert, silence during continued failure, and recovery notification.
+
+The new image uses Python's standard library for HTTP monitoring and Tini for signal forwarding/reaping; qBittorrent API-key and legacy password/temporary-password recovery remain supported.
 
 ## Network Architecture
 
@@ -213,19 +284,20 @@ qBittorrent usually uses `network_mode: "service:gluetun"`, so it shares Gluetun
 
 The watchdog mounts `/var/run/docker.sock` so it can:
 
-- restart containers as a last-resort recovery path
+- inspect Gluetun's health before considering VPN recovery
+- restart only Gluetun once as the optional final recovery step
 - read qBittorrent logs for legacy password recovery
 
 Docker socket access allows container control from inside the watchdog container. Only run this in an environment where you trust the image and Compose configuration.
 
-If you run the watchdog with a non-root `user:`, add the socket's group with `group_add` (find it with `stat -c %g /var/run/docker.sock`), or the restart fallback fails with permission denied.
+If you run the watchdog with a non-root `user:`, add the socket's group with `group_add` (find it with `stat -c %g /var/run/docker.sock`), or health inspection and password recovery fail with permission denied. Port syncing and VPN API recovery can still work without socket access, but health cannot be observed and the container fallback/password-log recovery cannot succeed.
 
 ## What You Can Remove
 
 If the watchdog is working for your stack, you generally do not need:
 
 - `VPN_PORT_FORWARDING_UP_COMMAND` / `VPN_PORT_FORWARDING_DOWN_COMMAND` on Gluetun
-- Docker healthchecks on Gluetun / qBittorrent solely for port-forward recovery
+- Extra qBittorrent healthchecks solely for port-forward recovery (keep Gluetun's healthcheck)
 - `willfarrell/autoheal` or similar auto-restart containers for this issue
 - cron jobs that check port files or restart containers
 
@@ -243,7 +315,15 @@ The build context contains:
 ```text
 gluetun-qbt-watchdog/
 ├── Dockerfile
-└── gluetun-qbt-watchdog.sh
+├── gluetun-qbt-watchdog.sh
+├── recovery.sh
+└── health-server.py
+```
+
+Run deterministic recovery, authentication, persistence, and HTTP health checks with Python 3.9+ and `/bin/sh`. They use disposable fixtures and loopback HTTP, not production APIs or Docker:
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## Publishing / Releases
@@ -266,7 +346,8 @@ After the first GHCR publish, make the package public in GitHub package settings
 
 - Gluetun with `VPN_PORT_FORWARDING=on` and HTTP control server enabled.
 - qBittorrent with WebUI/WebAPI enabled.
-- Docker socket access for restart fallback and legacy password recovery.
+- Docker socket access for health observation, optional Gluetun-container fallback, and legacy password-log recovery.
+- A writable persistent state volume, with one watchdog instance per volume.
 - Shared Docker network where the watchdog can reach Gluetun and qBittorrent WebAPI.
 
 ## Tested With

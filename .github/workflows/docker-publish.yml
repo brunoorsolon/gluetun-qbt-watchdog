@@ -18,6 +18,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check watchdog recovery and monitoring
+        run: |
+          sh -n gluetun-qbt-watchdog/gluetun-qbt-watchdog.sh
+          sh -n gluetun-qbt-watchdog/recovery.sh
+          python3 -B -m unittest discover -s tests -v
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
