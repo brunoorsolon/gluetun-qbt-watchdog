@@ -4,6 +4,9 @@ networks:
   vpn-net:
     name: vpn-net
 
+volumes:
+  watchdog-state:
+
 services:
   gluetun:
     image: qmcgaw/gluetun:latest
@@ -54,8 +57,13 @@ services:
       - gluetun # value of GLUETUN_CONTAINER_NAME
       - qbittorrent # value of QBT_CONTAINER_NAME
     volumes:
-      # Required for last-resort container restarts and legacy qBittorrent password recovery.
+      # Health inspection, optional Gluetun-only restart, and legacy password recovery.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Required to retain the attempt budget and one-alert-per-outage latch across recreation.
+      - watchdog-state:/state
+    # Kuma on vpn-net: http://gluetun-qbt-watchdog:8081/healthz (accept 200 only).
+    # For host-side Kuma, optionally publish on loopback; match HEALTH_PORT if changed:
+    # ports: ["127.0.0.1:8081:8081"]
     environment:
       - GLUETUN_CONTAINER_NAME=${GLUETUN_CONTAINER_NAME:-gluetun}
       - GLUETUN_API=http://${GLUETUN_CONTAINER_NAME:-gluetun}:${GLUETUN_API_PORT:-8000}
@@ -68,6 +76,12 @@ services:
       - QBT_PASS=${QBT_PASS:-}
       - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
       - PORT_MISS_THRESHOLD=${PORT_MISS_THRESHOLD:-3}
+      - MISSING_PORT_GRACE=${MISSING_PORT_GRACE:-300}
+      - GLUETUN_RECOVERY_GRACE=${GLUETUN_RECOVERY_GRACE:-300}
+      - RESTART_COOLDOWN=${RESTART_COOLDOWN:-900}
+      - MAX_VPN_RESTARTS=${MAX_VPN_RESTARTS:-2}
+      - RESTART_GLUETUN_CONTAINER=${RESTART_GLUETUN_CONTAINER:-true}
+      - STATE_DIR=/state
+      - HEALTH_BIND=0.0.0.0
+      - HEALTH_PORT=${HEALTH_PORT:-8081}
       - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
-      - MAX_RESTART_WAIT=${MAX_RESTART_WAIT:-120}
-      - ADDITIONAL_RESTART=${ADDITIONAL_RESTART:-}
