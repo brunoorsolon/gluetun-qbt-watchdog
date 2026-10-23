@@ -51,18 +51,33 @@ get_gluetun_port() {
         case "$status" in 401|403) return 2 ;; esac
         return 1
     fi
-    # Accept only the complete expected response, not a port embedded in an error body.
-    port=$(printf '%s' "${response%|*}" | tr '\r\n' '  ' | \
-        sed -n 's/^[[:space:]]*{[[:space:]]*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*}[[:space:]]*$/\1/p')
-    case "$port" in
-        ''|0[0-9]*) ;;
-        *)
-            if [ "${#port}" -le 5 ] && [ "$port" -le 65535 ]; then
-                printf '%s\n' "$port"
-                return 0
-            fi
-            ;;
-    esac
+    # Gluetun may include a ports array; validate the primary port without rejecting extra fields.
+    if port=$(printf '%s' "${response%|*}" | python3 -c '
+import json
+import sys
+
+
+def unique_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate JSON keys")
+    return result
+
+
+try:
+    response = json.load(sys.stdin, object_pairs_hook=unique_object)
+    if not isinstance(response, dict) or "error" in response:
+        raise ValueError("invalid response object")
+    port = response.get("port")
+    if type(port) is not int or not 0 <= port <= 65535:
+        raise ValueError("invalid port")
+except ValueError:
+    sys.exit(1)
+print(port)
+'); then
+        printf '%s\n' "$port"
+        return 0
+    fi
     log "WARNING: Invalid Gluetun port response; port is unknown." >&2
     return 3
 }
