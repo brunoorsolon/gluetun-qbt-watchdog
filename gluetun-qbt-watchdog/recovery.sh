@@ -109,6 +109,28 @@ mark_healthy() {
     fi
 }
 
+handle_manual_restart() {
+    [ -n "$WATCHDOG_API_KEY" ] && [ -f "$STATE_DIR/vpn-restart-request" ] || return 1
+    [ "$now" -ge "$cooldown_until" ] && [ "$now" -ge "$settle_until" ] || return 1
+
+    # Manual recovery neither consumes nor replenishes the automatic recovery budget/latch.
+    begin_outage manual_vpn_restart
+    cooldown_until=$((now + RESTART_COOLDOWN))
+    settle_until=$((now + GLUETUN_RECOVERY_GRACE))
+    save_state
+    rm "$STATE_DIR/vpn-restart-request" || fatal "Cannot consume manual VPN restart request."
+    emit_log "INFO: Processing manual VPN-only restart request."
+    if ! restart_vpn; then
+        last_error=vpn_restart_api_failed
+        emit_log "WARNING RESTART_FAILED: target=vpn; source=manual; reason=$last_error."
+    fi
+    now=$(clock_now)
+    cooldown_until=$((now + RESTART_COOLDOWN))
+    settle_until=$((now + GLUETUN_RECOVERY_GRACE))
+    save_state
+    return 0
+}
+
 handle_missing_port() {
     local health output
     begin_outage port_missing

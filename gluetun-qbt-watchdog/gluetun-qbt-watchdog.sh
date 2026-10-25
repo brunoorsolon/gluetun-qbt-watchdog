@@ -22,6 +22,7 @@ RESTART_GLUETUN_CONTAINER="${RESTART_GLUETUN_CONTAINER:-true}"
 STATE_DIR="${STATE_DIR:-/state}"
 HEALTH_PORT="${HEALTH_PORT:-8081}"
 HEALTH_STATUS_FILE="${HEALTH_STATUS_FILE:-/tmp/watchdog-health-status}"
+WATCHDOG_API_KEY="${WATCHDOG_API_KEY:-}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 export HEALTH_PORT
 HEARTBEAT_CYCLE_FREQUENCY="${HEARTBEAT_CYCLE_FREQUENCY:-10}"
@@ -33,7 +34,7 @@ emit_log() {
 }
 
 log() {
-    # Once latched, only an actual recovery or manual reset may produce another event.
+    # Automatic checks stay quiet while latched; explicit manual actions use emit_log.
     [ "${phase:-}" = unrecoverable ] || emit_log "$1"
 }
 
@@ -85,12 +86,12 @@ print(port)
 
 restart_vpn() {
     local failed=0
-    log "INFO RESTART_ATTEMPT: target=vpn; Restarting VPN via gluetun API..."
+    emit_log "INFO RESTART_ATTEMPT: target=vpn; Restarting VPN via gluetun API..."
     if ! curl -sf --connect-timeout 5 --max-time 10 -X PUT -H "X-API-Key: $GLUETUN_API_KEY" \
         -H "Content-Type: application/json" \
         -d '{"status":"stopped"}' \
         "$GLUETUN_API/v1/vpn/status" > /dev/null; then
-        log "WARNING: Gluetun VPN stop API call failed."
+        emit_log "WARNING: Gluetun VPN stop API call failed."
         failed=1
     fi
     sleep 5
@@ -99,7 +100,7 @@ restart_vpn() {
         -H "Content-Type: application/json" \
         -d '{"status":"running"}' \
         "$GLUETUN_API/v1/vpn/status" > /dev/null; then
-        log "WARNING: Gluetun VPN start API call failed."
+        emit_log "WARNING: Gluetun VPN start API call failed."
         failed=1
     fi
     return "$failed"
@@ -326,6 +327,10 @@ check_ports() {
 
 # ---- Startup ----
 validate_qbt_auth_mode || exit 1
+if [ -n "$WATCHDOG_API_KEY" ]; then
+    case "$WATCHDOG_API_KEY" in *[!0-9a-fA-F]*) fatal "WATCHDOG_API_KEY must contain 64 hexadecimal characters." ;; esac
+    [ "${#WATCHDOG_API_KEY}" -eq 64 ] || fatal "WATCHDOG_API_KEY must contain 64 hexadecimal characters."
+fi
 for value in "$CHECK_INTERVAL" "$HEARTBEAT_CYCLE_FREQUENCY" "$PORT_MISS_THRESHOLD" "$MISSING_PORT_GRACE" \
     "$GLUETUN_RECOVERY_GRACE" "$RESTART_COOLDOWN" "$MAX_VPN_RESTARTS" "$HEALTH_PORT"; do
     case "$value" in
@@ -346,7 +351,7 @@ load_state
 publish_health
 stale_after=$((CHECK_INTERVAL * 3))
 [ "$stale_after" -ge 180 ] || stale_after=180
-python3 "$SCRIPT_DIR/health-server.py" "$HEALTH_STATUS_FILE" "$stale_after" &
+python3 "$SCRIPT_DIR/health-server.py" "$HEALTH_STATUS_FILE" "$stale_after" "$STATE_DIR" &
 health_pid=$!
 trap 'kill "$health_pid" 2>/dev/null; wait "$health_pid" 2>/dev/null' EXIT
 trap 'exit 143' TERM
@@ -372,7 +377,9 @@ while true; do
         emit_log "INFO: Recovery budget manually reset; existing cooldown retained."
     fi
     cycle_count=$((cycle_count + 1))
-    check_ports
+    if ! handle_manual_restart; then
+        check_ports
+    fi
     save_state
     publish_health
     sleep "$CHECK_INTERVAL"

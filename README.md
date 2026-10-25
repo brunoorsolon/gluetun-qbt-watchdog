@@ -123,6 +123,7 @@ gluetun-qbt-watchdog:
     - STATE_DIR=/state
     - HEALTH_BIND=0.0.0.0
     - HEALTH_PORT=${HEALTH_PORT:-8081}
+    - WATCHDOG_API_KEY=${WATCHDOG_API_KEY:-}
     - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
 ```
 
@@ -170,7 +171,8 @@ image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.2
 | `RESTART_GLUETUN_CONTAINER` | `true` | Allow one final Gluetun-only container restart after the VPN budget is exhausted. Set `false` to use API recovery only. |
 | `STATE_DIR` | `/state` | Writable persistent directory for recovery counters, deadlines, and the alert latch. Mount a volume here; one watchdog per state volume. |
 | `HEALTH_BIND` | `0.0.0.0` | Health server bind address inside the watchdog container. Restrict exposure to your monitoring network. |
-| `HEALTH_PORT` | `8081` | HTTP port for `/healthz` and `/readyz`. Match any Docker port mapping to this container port. |
+| `HEALTH_PORT` | `8081` | HTTP port for monitoring and the optional manual VPN restart endpoint. Match any Docker port mapping to this container port. |
+| `WATCHDOG_API_KEY` | empty (control disabled) | Dedicated 64-character hexadecimal key for `POST /vpn/restart`, sent as `X-API-Key`. Generate independently of the Gluetun and qBittorrent keys. |
 | `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an OK heartbeat every N successful cycles. |
 
 ## qBittorrent Authentication Modes
@@ -232,6 +234,42 @@ docker exec gluetun-qbt-watchdog touch /state/reset-request
 
 Use your configured `STATE_DIR` if different. The next polling cycle consumes the request and starts a fresh missing-port window. Restarting the watchdog alone does **not** reset the budget. Do not delete the state volume as part of routine upgrades.
 
+### Manually restart only the VPN
+
+The optional `POST /vpn/restart` endpoint uses Gluetun's VPN stop/start API. It never restarts a container and also works with `DOCKER_ENABLED=false`. Leave `WATCHDOG_API_KEY` empty to disable it (404); monitoring remains available without authentication.
+
+1. Generate a dedicated random key locally:
+
+   ```bash
+   python3 -c 'import secrets; print(secrets.token_hex(32))'
+   ```
+
+2. Store the result as `WATCHDOG_API_KEY` in your private `.env` and recreate the watchdog with the environment mapping shown above. A nonempty key must contain exactly 64 hexadecimal characters; invalid configuration fails startup without printing the key. Keep the key out of Git, logs, and shared Compose output.
+
+3. From a client shell, enter the same key and send an empty POST. This host example requires the optional loopback port mapping:
+
+   ```bash
+   read -r -s -p 'Watchdog API key: ' WATCHDOG_API_KEY; printf '\n'
+   printf 'X-API-Key: %s\n' "$WATCHDOG_API_KEY" |
+     curl --fail-with-body --silent --show-error --request POST \
+       --header @- http://127.0.0.1:8081/vpn/restart
+   ```
+
+   From a client on `vpn-net`, use `http://gluetun-qbt-watchdog:8081/vpn/restart` instead. The header is passed on stdin rather than putting the key in curl's command-line arguments.
+
+| Response | Meaning |
+|---|---|
+| `202` with `{"status":"queued"}` | One VPN restart was queued, not completed. |
+| `409` with `{"status":"already_pending"}` | A request is already queued; no additional request was added. |
+| `401` / `404` | Missing or incorrect key / control disabled or unknown route. |
+| `400` / `503` | Nonempty or unsupported request body / stale or unavailable watchdog status, or unwritable queue. |
+
+The main watchdog loop processes the request on a polling cycle, after any existing `RESTART_COOLDOWN` and post-restart grace expire. With defaults, polling adds up to about 60 seconds plus API-operation time; a current cooldown can add up to 15 minutes. Startup also has a 30-second delay. There is one pending request slot in `STATE_DIR`; it survives watchdog recreation. After a request is consumed, another can be queued, but it still must wait for the persisted cooldown. Removing the key disables processing of pending requests too; remove `vpn-restart-request` from your configured state directory if you want to cancel one.
+
+Manual requests work even when the port is healthy or automatic recovery is latched off. They neither consume nor replenish the automatic attempt budget and do not clear the terminal latch; only confirmed recovery or the separate manual reset does that. Stop failures still get a start request. Watchdog logs the attempt and any API errors without logging the key; use `/healthz` and `/readyz` to observe subsequent recovery. A queued response does not guarantee execution if watchdog crashes while consuming the request.
+
+**Security and traffic impact:** the key authorizes a disruptive VPN stop/start, not a container restart. HTTP does not encrypt it: keep this port on a trusted Docker network or loopback, and use an authenticated TLS reverse proxy for remote access. Do not publish the port to the internet or enable request-header logging on the proxy. Restarting the VPN briefly interrupts traffic through Gluetun. Automatic recovery policy is unchanged and may later use its configured container fallback; set `RESTART_GLUETUN_CONTAINER=false` to prohibit that globally.
+
 ### Uptime Kuma and Dozzle/Gotify
 
 Configure two HTTP monitors in Kuma on the shared Docker network:
@@ -253,7 +291,7 @@ Both routes return the same JSON status, reason, and attempt counters. A 202 res
 - **Disable notifications on the containing group** so the silent availability monitor cannot trigger a group alert. Enable notifications on any other children whose failures still need to alert. The group can still display degradation.
 - Poll at your preferred interval (for example 60 seconds). Kuma's retries delay alerts for 503 and connection failures alike; do not use a very large retry count to suppress recovery warnings. Disable repeated/resend notifications if you want only down/up transitions. Validate the actual notification behavior with a controlled outage.
 - If checks stop updating, both endpoints return 503 after `max(180, 3 × CHECK_INTERVAL)` seconds, including when the last state was recovering. If the watchdog or its HTTP server dies, both endpoints are unreachable; the main process also exits when it detects the server has died.
-- Both endpoints are read-only, contain no secrets, and do not log every request. They have no reset/control API. Keep them on a trusted monitoring network; do not expose them publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
+- Both monitoring endpoints are read-only, contain no secrets, and do not log every request. The separate manual VPN control route is disabled unless `WATCHDOG_API_KEY` is configured. Keep them on a trusted monitoring network; do not expose them publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
 - **Do not use either endpoint to trigger autoheal/container restarts.** They report status, not a command to replenish the recovery budget.
 
 #### Count restart attempts and command failures
@@ -279,7 +317,7 @@ Replace the existing Dozzle rule (`message contains "Still no port" || message c
 message contains "UNRECOVERABLE"
 ```
 
-Only entry into the terminal state emits that marker. Continuing failures, changing reasons, endpoint requests, and watchdog restarts do not resend it. Docker permission errors are captured rather than repeatedly printed; a failed container-recovery attempt eventually produces `ERROR UNRECOVERABLE: docker_permission_denied; ...`. Other reason codes distinguish missing ports, API access, qBittorrent authentication/preferences, port-update failure, and restart API failures.
+Only entry into the terminal state emits that marker. Continuing failures, changing reasons, monitoring endpoint requests, and watchdog restarts do not resend it. Explicit manual VPN requests still log their attempts and API failures while latched. Docker permission errors are captured rather than repeatedly printed; a failed container-recovery attempt eventually produces `ERROR UNRECOVERABLE: docker_permission_denied; ...`. Other reason codes distinguish missing ports, API access, qBittorrent authentication/preferences, port-update failure, and restart API failures.
 
 The latch is saved **before** the error is logged to favor at-most-once notification: a process crash in that tiny interval can lose the Dozzle event, but the persisted unhealthy state remains visible to Kuma. Successful recovery produces one `INFO RECOVERED` message. This guarantees bounded emission by the watchdog, not delivery/deduplication by the external notification services.
 
@@ -331,6 +369,7 @@ services:
       QBT_AUTH_MODE: "auto"
       QBT_API_KEY: "${QBT_API_KEY}"
       STATE_DIR: "/state"
+      WATCHDOG_API_KEY: "${WATCHDOG_API_KEY:-}"
     volumes:
       - watchdog-state:/state
 

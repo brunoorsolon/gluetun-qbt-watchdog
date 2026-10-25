@@ -88,4 +88,6 @@ services:
       - STATE_DIR=/state
       - HEALTH_BIND=0.0.0.0
       - HEALTH_PORT=${HEALTH_PORT:-8081}
+      # Optional authenticated POST /vpn/restart; empty disables control.
+      - WATCHDOG_API_KEY=${WATCHDOG_API_KEY:-}
       - HEARTBEAT_CYCLE_FREQUENCY=${HEARTBEAT_CYCLE_FREQUENCY:-10}
