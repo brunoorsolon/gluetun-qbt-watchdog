@@ -157,6 +157,10 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.events(state, "stopped"), [[330], [1235]])
         self.assertEqual(self.events(state, "running"), [[335], [1240]])
         self.assertEqual(self.restarts(state), [[2140, ["restart", "--time", "10", "gluetun"]]])
+        self.assertEqual(log.count("RESTART_ATTEMPT:"), 3)
+        self.assertEqual(log.count("RESTART_ATTEMPT: target=vpn;"), 2)
+        self.assertEqual(log.count("RESTART_ATTEMPT: target=container;"), 1)
+        self.assertNotIn("RESTART_FAILED:", log)
         self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
         self.assertEqual(log.count("ERROR"), 1)
         self.assertEqual(state["health"][:2], ["unrecoverable", "port_missing_after_recovery"])
@@ -185,6 +189,8 @@ class WatchdogTests(unittest.TestCase):
         state, log = self.run_watchdog([{"http": 403}] * 12)
         self.assertEqual(self.events(state, "stopped"), [])
         self.assertEqual(self.events(state, "docker"), [])
+        self.assertNotIn("RESTART_ATTEMPT:", log)
+        self.assertNotIn("RESTART_FAILED:", log)
         self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
         self.assertEqual(state["health"][:2], ["unrecoverable", "gluetun_auth_failed"])
 
@@ -252,6 +258,22 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("stop API call failed", log)
         self.assertIn("start API call failed", log)
         self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
+        self.assertEqual(log.count("RESTART_ATTEMPT: target=vpn;"), 1)
+        self.assertEqual(log.count("RESTART_FAILED:"), 1)
+        self.assertIn("RESTART_FAILED: target=vpn; reason=vpn_restart_api_failed;", log)
+
+    def test_each_vpn_api_call_failure_emits_one_restart_failure(self):
+        for failure in ({"stopped_exit": 22}, {"running_exit": 28}):
+            with self.subTest(failure=failure):
+                state, log = self.run_watchdog(
+                    [failure] * 4, PORT_MISS_THRESHOLD=1, MISSING_PORT_GRACE=60,
+                    MAX_VPN_RESTARTS=1, RESTART_GLUETUN_CONTAINER="false",
+                )
+                self.assertEqual(len(self.events(state, "stopped")), 1)
+                self.assertEqual(len(self.events(state, "running")), 1)
+                self.assertEqual(log.count("RESTART_ATTEMPT:"), 1)
+                self.assertEqual(log.count("RESTART_FAILED:"), 1)
+                self.assertIn("RESTART_FAILED: target=vpn; reason=vpn_restart_api_failed;", log)
 
     def test_api_only_recovery_skips_docker_grace_and_disables_container_fallback(self):
         state, log = self.run_watchdog(
@@ -317,6 +339,10 @@ class WatchdogTests(unittest.TestCase):
             RESTART_COOLDOWN=60, GLUETUN_RECOVERY_GRACE=60,
         )
         self.assertEqual(len(self.restarts(state)), 1)
+        self.assertEqual(log.count("RESTART_ATTEMPT:"), 2)
+        self.assertEqual(log.count("RESTART_ATTEMPT: target=container;"), 1)
+        self.assertEqual(log.count("RESTART_FAILED:"), 1)
+        self.assertIn("RESTART_FAILED: target=container; reason=docker_permission_denied;", log)
         self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
         self.assertEqual(state["health"][:2], ["unrecoverable", "docker_permission_denied"])
         self.assertNotIn("permission denied", log)  # Raw Docker stderr must not spam the old Dozzle rule.

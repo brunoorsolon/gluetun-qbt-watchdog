@@ -256,6 +256,23 @@ Both routes return the same JSON status, reason, and attempt counters. A 202 res
 - Both endpoints are read-only, contain no secrets, and do not log every request. They have no reset/control API. Keep them on a trusted monitoring network; do not expose them publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
 - **Do not use either endpoint to trigger autoheal/container restarts.** They report status, not a command to replenish the recovery budget.
 
+#### Count restart attempts and command failures
+
+Scope these Dozzle rules to the watchdog container. The same event codes cover VPN API restarts and the optional full Gluetun-container restart:
+
+| What to monitor | Dozzle condition |
+| --- | --- |
+| Every restart attempt | `message contains "RESTART_ATTEMPT:"` |
+| Every failed restart command | `message contains "RESTART_FAILED:"` |
+
+Each attempt emits one `RESTART_ATTEMPT:` line immediately before the restart command. A VPN attempt consists of both stop and start API calls and counts once, not twice. If either or both API calls fail, the attempt emits one `RESTART_FAILED:` line after the start call. A failed Docker restart also emits one `RESTART_FAILED:` line. Failure lines include a fixed `reason=` code; raw Docker error output is not logged.
+
+Both events include `target=vpn` or `target=container`. To count only full Gluetun-container restart attempts, use `message contains "RESTART_ATTEMPT: target=container;"`; for only those failures, use `message contains "RESTART_FAILED: target=container;"`. Do not add failure counts to attempt counts: a failed attempt produces both events.
+
+These events report attempts and command errors, not confirmed VPN/port recovery. A command can succeed while the port stays missing; keep the terminal alert below for that case. Log counts are best-effort, not a durable restart counter: process crashes and external log retention or delivery can lose events. Existing cooldowns, budgets, and the terminal latch are unchanged.
+
+#### Alert when recovery is exhausted
+
 Replace the existing Dozzle rule (`message contains "Still no port" || message contains "permission denied"`) with this condition, scoped to the watchdog container:
 
 ```text
