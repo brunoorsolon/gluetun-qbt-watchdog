@@ -153,17 +153,18 @@ handle_missing_port() {
             save_state
             if ! restart_vpn; then
                 last_error=vpn_restart_api_failed
+                log "WARNING RESTART_FAILED: target=vpn; reason=$last_error; the attempt is consumed."
             fi
         else
             container_attempted=1
             save_state
-            log "INFO: VPN attempts exhausted; restarting only Gluetun container $GLUETUN_CONTAINER_NAME."
+            log "INFO RESTART_ATTEMPT: target=container; VPN attempts exhausted; restarting only Gluetun container $GLUETUN_CONTAINER_NAME."
             if ! output=$(timeout 90 docker restart --time 10 "$GLUETUN_CONTAINER_NAME" 2>&1); then
                 case "$output" in
                     *'permission denied'*) last_error=docker_permission_denied ;;
                     *) last_error=gluetun_container_restart_failed ;;
                 esac
-                log "WARNING: Gluetun container restart failed; the attempt is consumed."
+                log "WARNING RESTART_FAILED: target=container; reason=$last_error; Gluetun container restart failed; the attempt is consumed."
             fi
         fi
         now=$(clock_now)

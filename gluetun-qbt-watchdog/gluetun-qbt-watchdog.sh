@@ -85,7 +85,7 @@ print(port)
 
 restart_vpn() {
     local failed=0
-    log "Restarting VPN via gluetun API..."
+    log "INFO RESTART_ATTEMPT: target=vpn; Restarting VPN via gluetun API..."
     if ! curl -sf --connect-timeout 5 --max-time 10 -X PUT -H "X-API-Key: $GLUETUN_API_KEY" \
         -H "Content-Type: application/json" \
         -d '{"status":"stopped"}' \
