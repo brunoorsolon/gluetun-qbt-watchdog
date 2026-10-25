@@ -117,13 +117,16 @@ handle_missing_port() {
     port_miss_count=$((port_miss_count + 1))
     [ "$phase" != unrecoverable ] || return 0
 
-    health=$(timeout 10 docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' \
-        "$GLUETUN_CONTAINER_NAME" 2>/dev/null) || health=unknown
-    case "$health" in 'running healthy'|'running unhealthy'|'running starting'|'restarting unhealthy') ;; *) health=unknown ;; esac
-    log "INFO: Port missing for $((now - missing_since))s ($port_miss_count/$PORT_MISS_THRESHOLD checks); API=ok, container/health=$health; VPN attempts=$vpn_attempts/$MAX_VPN_RESTARTS."
-    if [ "$health" != 'running healthy' ] && [ "$recovery_seen_at" -eq 0 ]; then
-        recovery_seen_at=$now
+    health=disabled
+    if [ "$DOCKER_ENABLED" = true ]; then
+        health=$(timeout 10 docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}unknown{{end}}' \
+            "$GLUETUN_CONTAINER_NAME" 2>/dev/null) || health=unknown
+        case "$health" in 'running healthy'|'running unhealthy'|'running starting'|'restarting unhealthy') ;; *) health=unknown ;; esac
+        if [ "$health" != 'running healthy' ] && [ "$recovery_seen_at" -eq 0 ]; then
+            recovery_seen_at=$now
+        fi
     fi
+    log "INFO: Port missing for $((now - missing_since))s ($port_miss_count/$PORT_MISS_THRESHOLD checks); API=ok, container/health=$health; VPN attempts=$vpn_attempts/$MAX_VPN_RESTARTS."
 
     if [ "$port_miss_count" -lt "$PORT_MISS_THRESHOLD" ] || [ $((now - missing_since)) -lt "$MISSING_PORT_GRACE" ]; then
         log "INFO: Recovery deferred: missing-port count or grace threshold not reached."
@@ -136,7 +139,7 @@ handle_missing_port() {
         else
             unrecoverable "$last_error"
         fi
-    elif [ "$recovery_seen_at" -ne 0 ] && [ $((now - recovery_seen_at)) -lt "$GLUETUN_RECOVERY_GRACE" ]; then
+    elif [ "$DOCKER_ENABLED" = true ] && [ "$recovery_seen_at" -ne 0 ] && [ $((now - recovery_seen_at)) -lt "$GLUETUN_RECOVERY_GRACE" ]; then
         log "INFO: Recovery deferred: allowing Gluetun's own recovery window to finish."
     elif [ "$now" -lt "$cooldown_until" ]; then
         log "INFO: Recovery deferred: restart cooldown has $((cooldown_until - now))s remaining."

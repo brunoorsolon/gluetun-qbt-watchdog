@@ -2,6 +2,7 @@
 # gluetun-qbt-watchdog
 # Single script that keeps gluetun port forwarding and qBittorrent in sync.
 
+DOCKER_ENABLED="${DOCKER_ENABLED-true}"
 GLUETUN_CONTAINER_NAME="${GLUETUN_CONTAINER_NAME:-gluetun}"
 GLUETUN_API="${GLUETUN_API:-http://gluetun:8000}"
 GLUETUN_API_KEY="${GLUETUN_API_KEY:-}"
@@ -232,6 +233,7 @@ get_qbt_init_password() {
 
 # If the configured password fails, use the temporary password from logs and replace it.
 recover_qbt_password() {
+    [ "$DOCKER_ENABLED" = true ] || return 1
     if [ -z "$QBT_PASS" ]; then
         log "WARNING: QBT_PASS is empty, cannot recover qBittorrent login."
         return 1
@@ -332,7 +334,11 @@ for value in "$CHECK_INTERVAL" "$HEARTBEAT_CYCLE_FREQUENCY" "$PORT_MISS_THRESHOL
     [ "${#value}" -le 9 ] || fatal "Configuration number too large."
 done
 [ "$HEALTH_PORT" -le 65535 ] || fatal "HEALTH_PORT must be between 1 and 65535."
+case "$DOCKER_ENABLED" in true|false) ;; *) fatal "DOCKER_ENABLED must be true or false." ;; esac
 case "$RESTART_GLUETUN_CONTAINER" in true|false) ;; *) fatal "RESTART_GLUETUN_CONTAINER must be true or false." ;; esac
+if [ "$DOCKER_ENABLED" = false ]; then
+    RESTART_GLUETUN_CONTAINER=false
+fi
 
 umask 077
 mkdir -p "$STATE_DIR" || fatal "Cannot create STATE_DIR; mount a writable persistent volume."
@@ -346,6 +352,9 @@ trap 'kill "$health_pid" 2>/dev/null; wait "$health_pid" 2>/dev/null' EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 log "INFO: Watchdog started; interval=${CHECK_INTERVAL}s; auth=$(qbt_auth_description); health port=$HEALTH_PORT."
+if [ "$DOCKER_ENABLED" = false ]; then
+    log "INFO: API-only mode: Docker health inspection, container restarts, and temporary-password recovery are disabled."
+fi
 log "INFO: Missing-port threshold=$PORT_MISS_THRESHOLD; grace=${MISSING_PORT_GRACE}s; Gluetun recovery grace=${GLUETUN_RECOVERY_GRACE}s; cooldown=${RESTART_COOLDOWN}s; VPN budget=$MAX_VPN_RESTARTS; container fallback=$RESTART_GLUETUN_CONTAINER."
 if [ -n "${MAX_RESTART_WAIT+x}${ADDITIONAL_RESTART+x}${VPN_RESTART_COOLDOWN+x}" ]; then
     log "WARNING: MAX_RESTART_WAIT, ADDITIONAL_RESTART and VPN_RESTART_COOLDOWN are ignored. Only Gluetun may be restarted; use GLUETUN_RECOVERY_GRACE and RESTART_COOLDOWN."
