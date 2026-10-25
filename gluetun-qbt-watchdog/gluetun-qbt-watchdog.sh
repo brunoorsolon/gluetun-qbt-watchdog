@@ -365,7 +365,7 @@ if [ -n "${MAX_RESTART_WAIT+x}${ADDITIONAL_RESTART+x}${VPN_RESTART_COOLDOWN+x}" 
     log "WARNING: MAX_RESTART_WAIT, ADDITIONAL_RESTART and VPN_RESTART_COOLDOWN are ignored. Only Gluetun may be restarted; use GLUETUN_RECOVERY_GRACE and RESTART_COOLDOWN."
 fi
 
-sleep 30
+wait_for_check 30
 cycle_count=0
 while true; do
     kill -0 "$health_pid" 2>/dev/null || fatal "Health server exited; check HEALTH_BIND and HEALTH_PORT."
@@ -382,5 +382,5 @@ while true; do
     fi
     save_state
     publish_health
-    sleep "$CHECK_INTERVAL"
+    wait_for_check "$CHECK_INTERVAL"
 done
