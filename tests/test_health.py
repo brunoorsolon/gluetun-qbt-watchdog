@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import importlib.util
 import io
@@ -20,15 +21,23 @@ class HealthEndpointTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="watchdog-health-")
         self.path = Path(self.directory.name) / "status"
-        self.server = health.make_server(("127.0.0.1", 0), self.path, 180)
+        self.key = "a" * 64
+        self.request_path = Path(self.directory.name) / "vpn-restart-request"
+        self.start_server(self.key)
+
+    def start_server(self, key, state_dir=None):
+        self.server = health.make_server(("127.0.0.1", 0), self.path, 180, key, state_dir or self.directory.name)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_port}/healthz"
 
-    def tearDown(self):
+    def stop_server(self):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join()
+
+    def tearDown(self):
+        self.stop_server()
         self.directory.cleanup()
 
     def publish(self, phase, reason, age=0):
@@ -85,7 +94,68 @@ class HealthEndpointTests(unittest.TestCase):
                     self.assertEqual(status, 503)
                     self.assertEqual(json.loads(body)["reason"], "watchdog_status_unavailable")
 
-    def test_endpoint_has_no_control_routes(self):
+    def post(self, key=None, data=None, **headers):
+        if key is not None:
+            headers["X-API-Key"] = key
+        request = urllib.request.Request(self.url.replace("healthz", "vpn/restart"),
+                                         method="POST", data=data, headers=headers)
+        return self.get(request)
+
+    def test_restart_requires_correct_key_and_has_no_access_logs(self):
+        self.publish("healthy", "ports_synced")
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            for key in (None, "", "wrong", "b" * 64, "é" * 64):
+                with self.subTest(key=key):
+                    status, _, body = self.post(key)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(json.loads(body), {"error": "unauthorized"})
+                    self.assertFalse(self.request_path.exists())
+        self.assertEqual(output.getvalue(), "")
+
+    def test_restart_disabled_without_key(self):
+        self.stop_server()
+        self.start_server("")
+        self.publish("healthy", "ports_synced")
+        self.assertEqual(self.post(self.key)[0], 404)
+        self.assertFalse(self.request_path.exists())
+
+    def test_concurrent_requests_queue_one_private_marker_without_changing_health(self):
+        self.publish("unrecoverable", "port_missing_after_recovery")
+        before = self.path.read_text()
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            responses = list(pool.map(lambda _: self.post(self.key), range(5)))
+        self.assertEqual(sorted(response[0] for response in responses), [202, 409, 409, 409, 409])
+        self.assertEqual(self.request_path.read_bytes(), b"")
+        self.assertEqual(self.request_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.path.read_text(), before)
+        self.assertTrue(all(response[1]["Cache-Control"] == "no-store" for response in responses))
+
+    def test_restart_rejects_bodies_and_unavailable_watchdog(self):
+        self.publish("healthy", "ports_synced")
+        for data, headers in ((b"unexpected", {}), (None, {"Transfer-Encoding": "chunked"})):
+            self.assertEqual(self.post(self.key, data, **headers)[0], 400)
+            self.assertFalse(self.request_path.exists())
+        for age in (181, -10):
+            self.publish("healthy", "ports_synced", age=age)
+            self.assertEqual(self.post(self.key)[0], 503)
+            self.assertFalse(self.request_path.exists())
+        self.path.unlink()
+        self.assertEqual(self.post(self.key)[0], 503)
+        self.assertFalse(self.request_path.exists())
+
+    def test_unavailable_restart_queue_fails_without_success_response(self):
+        self.stop_server()
+        self.start_server(self.key, Path(self.directory.name) / "missing-directory")
+        self.publish("healthy", "ports_synced")
+        status, _, body = self.post(self.key)
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body), {"error": "restart_queue_unavailable"})
+        self.assertFalse(self.request_path.exists())
+
+    def test_get_cannot_trigger_restart_or_reset(self):
+        self.assertEqual(self.get(self.url.replace("healthz", "vpn/restart"))[0], 404)
+        self.assertFalse(self.request_path.exists())
         self.assertEqual(self.get(self.url.replace("healthz", "reset"))[0], 404)
         self.publish("unrecoverable", "port_missing_after_recovery")
         before = self.path.read_text()
