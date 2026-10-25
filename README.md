@@ -26,7 +26,7 @@ Every cycle, the watchdog:
 2. Requires a configurable number of confirmed missing-port checks and elapsed grace time before bounded Gluetun-only recovery. qBittorrent and other containers are never restarted or stopped.
 3. Authenticates to qBittorrent using either API-key auth or legacy username/password auth.
 4. Updates qBittorrent's `listen_port` when it differs from Gluetun's forwarded port.
-5. Exposes `/healthz` for Uptime Kuma. Exhausted recovery produces one `ERROR UNRECOVERABLE` event per outage, not a stream of alerts.
+5. Exposes `/healthz` for strict port availability and `/readyz` for actionable Uptime Kuma alerts. Exhausted recovery produces one `ERROR UNRECOVERABLE` event per outage, not a stream of alerts.
 
 Example logs:
 
@@ -170,7 +170,7 @@ image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.2
 | `RESTART_GLUETUN_CONTAINER` | `true` | Allow one final Gluetun-only container restart after the VPN budget is exhausted. Set `false` to use API recovery only. |
 | `STATE_DIR` | `/state` | Writable persistent directory for recovery counters, deadlines, and the alert latch. Mount a volume here; one watchdog per state volume. |
 | `HEALTH_BIND` | `0.0.0.0` | Health server bind address inside the watchdog container. Restrict exposure to your monitoring network. |
-| `HEALTH_PORT` | `8081` | HTTP port for `/healthz`. Match any Docker port mapping to this container port. |
+| `HEALTH_PORT` | `8081` | HTTP port for `/healthz` and `/readyz`. Match any Docker port mapping to this container port. |
 | `HEARTBEAT_CYCLE_FREQUENCY` | `10` | Log an OK heartbeat every N successful cycles. |
 
 ## qBittorrent Authentication Modes
@@ -214,7 +214,7 @@ Password recovery is not used in API-key mode. If you are setting up a new qBitt
 
 For the simple “times until restart” lever, set `PORT_MISS_THRESHOLD=10` with `CHECK_INTERVAL=60`. Ten confirmed misses span roughly nine minutes from the first miss; increasing that threshold does not slow successful port syncing. Timers are checked on polling cycles, and HTTP/restart operations add their execution time.
 
-With defaults and no additional Gluetun health delays, the approximate timeline from the first missing port is: first VPN restart at 5 minutes, second at 20 minutes, one Gluetun-container restart at 35 minutes, then a terminal alert at 40 minutes. Kuma can alert sooner because `/healthz` is already returning 503 during recovery. Set its retry tolerance accordingly.
+With defaults and no additional Gluetun health delays, the approximate timeline from the first missing port is: first VPN restart at 5 minutes, second at 20 minutes, one Gluetun-container restart at 35 minutes, then a terminal alert at 40 minutes. The strict `/healthz` endpoint already returns 503 during recovery. Use `/readyz` with 200 and 202 accepted to alert only when recovery is terminal or watchdog checks are unavailable.
 
 **A Gluetun container restart still interrupts every app sharing its network namespace.** It can also leave dependent apps needing manual network recovery; this watchdog deliberately will not restart them. Set `RESTART_GLUETUN_CONTAINER=false` if that trade-off is unacceptable. A missing forwarded port is not a VPN leak detector.
 
@@ -234,14 +234,27 @@ Use your configured `STATE_DIR` if different. The next polling cycle consumes th
 
 ### Uptime Kuma and Dozzle/Gotify
 
-Configure an HTTP monitor in Kuma:
+Configure two HTTP monitors in Kuma on the shared Docker network:
 
-- URL on the shared Docker network: `http://gluetun-qbt-watchdog:8081/healthz`.
-- Accept **200 only**. It means both APIs were checked and the ports match. Startup, recovery, API/auth/sync failures, and the terminal state return **503** with a short JSON reason and attempt counters.
-- Poll at your preferred interval (for example 60 seconds), tolerate transient failures using Kuma's retry settings, and disable repeated/resend notifications if you want only down/up transitions. Validate the actual notification behavior with a controlled outage.
-- If checks stop updating, the endpoint returns 503 after `max(180, 3 × CHECK_INTERVAL)` seconds. If the watchdog or its HTTP server dies, the endpoint is unreachable; the main process also exits when it detects the server has died.
-- The endpoint is read-only, contains no secrets, and does not log every request. It has no reset/control API. Keep it on a trusted monitoring network; do not expose it publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
-- **Do not use this endpoint to trigger autoheal/container restarts.** It reports service health, not a command to replenish the recovery budget.
+| Monitor | URL | Accepted status codes | Notifications |
+|---|---|---|---|
+| VPN port availability | `http://gluetun-qbt-watchdog:8081/healthz` | **200 only** | **Off**; shows every interruption |
+| VPN needs attention | `http://gluetun-qbt-watchdog:8081/readyz` | **200 and 202 only** | **On**; reports terminal recovery or watchdog failure |
+
+| Watchdog state | `/healthz` | `/readyz` |
+|---|---|---|
+| Healthy: both APIs checked and ports match | 200 | 200 |
+| Recovering: startup, grace/cooldown wait, recovery attempt, or a failure still within its grace period | 503 | 202 |
+| Unrecoverable: automatic recovery latched off | 503 | 503 |
+| Checks stale, or status missing/invalid | 503 | 503 |
+
+Both routes return the same JSON status, reason, and attempt counters. A 202 response distinguishes recovery at the API level, but an accepted 202 appears **Up (green)** in Kuma, not permanently yellow. Recovery can remain quiet throughout a long cooldown even while incoming connectivity is impaired. `unrecoverable` means automatic restart attempts are disabled; monitoring and port-sync attempts continue, and confirmed recovery clears the latch.
+
+- **Disable notifications on the containing group** so the silent availability monitor cannot trigger a group alert. Enable notifications on any other children whose failures still need to alert. The group can still display degradation.
+- Poll at your preferred interval (for example 60 seconds). Kuma's retries delay alerts for 503 and connection failures alike; do not use a very large retry count to suppress recovery warnings. Disable repeated/resend notifications if you want only down/up transitions. Validate the actual notification behavior with a controlled outage.
+- If checks stop updating, both endpoints return 503 after `max(180, 3 × CHECK_INTERVAL)` seconds, including when the last state was recovering. If the watchdog or its HTTP server dies, both endpoints are unreachable; the main process also exits when it detects the server has died.
+- Both endpoints are read-only, contain no secrets, and do not log every request. They have no reset/control API. Keep them on a trusted monitoring network; do not expose them publicly. Host-side Kuma can use the optional loopback port mapping; remote Kuma needs an explicitly allowed LAN address/port instead.
+- **Do not use either endpoint to trigger autoheal/container restarts.** They report status, not a command to replenish the recovery budget.
 
 Replace the existing Dozzle rule (`message contains "Still no port" || message contains "permission denied"`) with this condition, scoped to the watchdog container:
 

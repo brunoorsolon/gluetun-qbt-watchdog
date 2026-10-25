@@ -62,7 +62,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Required to retain the attempt budget and one-alert-per-outage latch across recreation.
       - watchdog-state:/state
-    # Kuma on vpn-net: http://gluetun-qbt-watchdog:8081/healthz (accept 200 only).
+    # Kuma on vpn-net: /healthz accepts 200 only (availability; notifications off).
+    # Alert monitor: http://gluetun-qbt-watchdog:8081/readyz accepts 200 and 202.
+    # Disable group notifications so availability failures do not trigger group alerts.
     # For host-side Kuma, optionally publish on loopback; match HEALTH_PORT if changed:
     # ports: ["127.0.0.1:8081:8081"]
     environment:
