@@ -109,14 +109,32 @@ mark_healthy() {
     fi
 }
 
+wait_for_check() {
+    local remaining=$1
+    if [ -z "$WATCHDOG_API_KEY" ]; then
+        sleep "$remaining"
+        return
+    fi
+    while [ "$remaining" -gt 0 ]; do
+        [ ! -f "$STATE_DIR/vpn-restart-request" ] || return 0
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+}
+
+extend_automatic_waits() {
+    local deadline=$((now + RESTART_COOLDOWN))
+    [ "$cooldown_until" -ge "$deadline" ] || cooldown_until=$deadline
+    deadline=$((now + GLUETUN_RECOVERY_GRACE))
+    [ "$settle_until" -ge "$deadline" ] || settle_until=$deadline
+}
+
 handle_manual_restart() {
     [ -n "$WATCHDOG_API_KEY" ] && [ -f "$STATE_DIR/vpn-restart-request" ] || return 1
-    [ "$now" -ge "$cooldown_until" ] && [ "$now" -ge "$settle_until" ] || return 1
 
-    # Manual recovery neither consumes nor replenishes the automatic recovery budget/latch.
+    # Explicit operator requests bypass automatic timers without resetting its budget/latch.
     begin_outage manual_vpn_restart
-    cooldown_until=$((now + RESTART_COOLDOWN))
-    settle_until=$((now + GLUETUN_RECOVERY_GRACE))
+    extend_automatic_waits
     save_state
     rm "$STATE_DIR/vpn-restart-request" || fatal "Cannot consume manual VPN restart request."
     emit_log "INFO: Processing manual VPN-only restart request."
@@ -125,8 +143,7 @@ handle_manual_restart() {
         emit_log "WARNING RESTART_FAILED: target=vpn; source=manual; reason=$last_error."
     fi
     now=$(clock_now)
-    cooldown_until=$((now + RESTART_COOLDOWN))
-    settle_until=$((now + GLUETUN_RECOVERY_GRACE))
+    extend_automatic_waits
     save_state
     return 0
 }

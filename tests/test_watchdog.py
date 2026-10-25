@@ -16,6 +16,32 @@ import urllib.request
 SCRIPT = Path(__file__).resolve().parents[1] / "gluetun-qbt-watchdog/gluetun-qbt-watchdog.sh"
 
 
+def request_restart(state, sample):
+    for _ in range(sample.get("manual_restart", 1)):
+        # The shell fixture uses virtual time; HTTP freshness needs a real timestamp.
+        health_path = Path(os.environ["HEALTH_STATUS_FILE"])
+        fields = health_path.read_text().split()
+        fields[0] = str(time.clock_gettime(time.CLOCK_BOOTTIME))
+        health_path.write_text(" ".join(fields) + "\n")
+        request = urllib.request.Request(
+            f'http://127.0.0.1:{os.environ["HEALTH_PORT"]}/vpn/restart', method="POST",
+            headers={"X-API-Key": sample.get("request_key", os.environ.get("WATCHDOG_API_KEY", ""))},
+        )
+        for attempt in range(100):
+            try:
+                response = urllib.request.urlopen(request, timeout=2)
+            except urllib.error.HTTPError as error:
+                response = error
+            except urllib.error.URLError:
+                if attempt == 99:
+                    raise
+                time.sleep(0.01)
+                continue
+            with response:
+                state.setdefault("requests", []).append([state["time"], response.status])
+            break
+
+
 def fake_command(command, args):
     path = Path(os.environ["WATCHDOG_TEST_STATE"])
     state = json.loads(path.read_text())
@@ -24,6 +50,10 @@ def fake_command(command, args):
     if command == "sleep":
         state.setdefault("pid", os.getppid())
         state["time"] += int(args[0])
+        request_at = state["samples"][0].get("manual_restart_at")
+        if request_at is not None and state["time"] >= request_at and not state.get("request_sent"):
+            request_restart(state, state["samples"][0])
+            state["request_sent"] = True
     elif command == "cut":
         assert args == ["-d.", "-f1", "/proc/uptime"]
         output = str(state["time"])
@@ -56,29 +86,8 @@ def fake_command(command, args):
             state["index"] += 1
             if sample.get("manual_reset"):
                 (Path(os.environ["STATE_DIR"]) / "reset-request").touch()
-            for _ in range(sample.get("manual_restart", 0)):
-                # The shell fixture uses virtual time; HTTP freshness needs a real timestamp.
-                health_path = Path(os.environ["HEALTH_STATUS_FILE"])
-                fields = health_path.read_text().split()
-                fields[0] = str(time.clock_gettime(time.CLOCK_BOOTTIME))
-                health_path.write_text(" ".join(fields) + "\n")
-                request = urllib.request.Request(
-                    f'http://127.0.0.1:{os.environ["HEALTH_PORT"]}/vpn/restart', method="POST",
-                    headers={"X-API-Key": sample.get("request_key", os.environ.get("WATCHDOG_API_KEY", ""))},
-                )
-                for attempt in range(100):
-                    try:
-                        response = urllib.request.urlopen(request, timeout=2)
-                    except urllib.error.HTTPError as error:
-                        response = error
-                    except urllib.error.URLError:
-                        if attempt == 99:
-                            raise
-                        time.sleep(0.01)
-                        continue
-                    with response:
-                        state.setdefault("requests", []).append([state["time"], response.status])
-                    break
+            if "manual_restart" in sample:
+                request_restart(state, sample)
             output = sample.get("body", json.dumps({"port": sample.get("port", 0)}))
             output += "|" + str(sample.get("http", 200))
             code = sample.get("curl_exit", 0)
@@ -420,8 +429,8 @@ class WatchdogTests(unittest.TestCase):
             DOCKER_ENABLED="false",
         )
         self.assertEqual([status for _, status in state["requests"]], [202, 409])
-        self.assertEqual(self.events(state, "stopped"), [[92]])
-        self.assertEqual(self.events(state, "running"), [[97]])
+        self.assertEqual(self.events(state, "stopped"), [[32]])
+        self.assertEqual(self.events(state, "running"), [[37]])
         self.assertEqual(state["health"][:2], ["healthy", "ports_synced"])
         self.assertNotIn("a" * 64, log)
 
@@ -452,35 +461,62 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("stop API call failed", log)
         self.assertEqual(log.count("RESTART_ATTEMPT: target=vpn;"), 2)
 
-    def test_pending_manual_request_waits_for_grace_without_container_fallback(self):
-        state, _ = self.run_watchdog(
-            [{}, {"manual_restart": 1}] + [{}] * 4, WATCHDOG_API_KEY="a" * 64,
-            MAX_VPN_RESTARTS=1, PORT_MISS_THRESHOLD=1, MISSING_PORT_GRACE=60,
-            RESTART_COOLDOWN=60, GLUETUN_RECOVERY_GRACE=300,
+    @staticmethod
+    def seed_manual_recovery(root):
+        state_dir = root / "state"
+        state_dir.mkdir()
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        (state_dir / "recovery.state").write_text(
+            f"1 {boot_id} unrecoverable port_missing_after_recovery 1 0 1 10 0 2 0 86400 86400 none\n"
         )
-        stopped = self.events(state, "stopped")
-        self.assertEqual(len(stopped), 2)
-        self.assertGreaterEqual(stopped[1][0] - self.events(state, "running")[0][0], 300)
-        self.assertEqual(state["health"][2:], ["1", "0"])
-        self.assertEqual(self.restarts(state), [])
 
-    def test_pending_manual_request_and_cooldown_survive_recreation(self):
+    def test_manual_request_wakes_startup_and_poll_wait_despite_automatic_timers(self):
+        for request_at in (1, 31):
+            with self.subTest(request_at=request_at), tempfile.TemporaryDirectory(prefix="watchdog-manual-") as directory:
+                root = Path(directory)
+                self.seed_manual_recovery(root)
+                state, _ = self.run_watchdog(
+                    [{"http": 403, "manual_restart_at": request_at}, {"http": 403}], root,
+                    WATCHDOG_API_KEY="a" * 64, RESTART_COOLDOWN=43200,
+                )
+                accepted_at, status = state["requests"][0]
+                self.assertEqual(status, 202)
+                self.assertEqual(len(state["requests"]), 1)
+                self.assertEqual(len(self.events(state, "stopped")), 1)
+                self.assertLessEqual(self.events(state, "stopped")[0][0] - accepted_at, 1)
+                self.assertEqual(self.events(state, "running")[0][0] - self.events(state, "stopped")[0][0], 5)
+                self.assertEqual(state["health"][0], "unrecoverable")
+                self.assertEqual(state["health"][2:], ["2", "0"])
+                self.assertEqual(state["persisted"].split()[11:13], ["86400", "86400"])
+                self.assertEqual(self.events(state, "docker"), [])
+
+    def test_pending_manual_request_survives_disabled_control_then_runs_on_recreation(self):
         with tempfile.TemporaryDirectory(prefix="watchdog-manual-") as directory:
             root = Path(directory)
-            settings = dict(WATCHDOG_API_KEY="a" * 64)
-            state, _ = self.run_watchdog([{"port": 54128, "manual_restart": 2}] * 2, root, **settings)
-            first_start = self.events(state, "running")[0][0]
-            self.assertEqual(len(self.events(state, "stopped")), 1)
-            self.assertEqual([status for _, status in state["requests"]], [202, 409, 202, 409])
-            self.assertTrue((root / "state/vpn-restart-request").exists())
-            state, _ = self.run_watchdog([{"port": 54128}] * 4, root, **settings)
+            self.seed_manual_recovery(root)
+            request_path = root / "state/vpn-restart-request"
+            request_path.touch()
+            state, _ = self.run_watchdog([{"http": 403}], root)
             self.assertEqual(self.events(state, "stopped"), [])
-            self.assertTrue((root / "state/vpn-restart-request").exists())
-            state, _ = self.run_watchdog([{"port": 54128}] * 14, root, **settings)
-            self.assertEqual(len(self.events(state, "stopped")), 1)
-            self.assertGreaterEqual(self.events(state, "stopped")[0][0] - first_start, 900)
-            self.assertFalse((root / "state/vpn-restart-request").exists())
-            self.assertEqual(self.restarts(state), [])
+            self.assertTrue(request_path.exists())
+            previous_time = state["time"]
+            state, _ = self.run_watchdog([{"http": 403}], root, WATCHDOG_API_KEY="a" * 64,
+                                         RESTART_COOLDOWN=43200)
+            self.assertEqual(self.events(state, "stopped"), [[previous_time]])
+            self.assertFalse(request_path.exists())
+            self.assertEqual(state["health"][2:], ["2", "0"])
+            self.assertEqual(self.events(state, "docker"), [])
+
+    def test_manual_restart_still_defers_subsequent_automatic_recovery(self):
+        state, _ = self.run_watchdog(
+            [{"http": 403, "manual_restart": 1}] + [{}] * 3, WATCHDOG_API_KEY="a" * 64,
+            PORT_MISS_THRESHOLD=1, MISSING_PORT_GRACE=1, GLUETUN_RECOVERY_GRACE=1,
+            RESTART_COOLDOWN=43200,
+        )
+        self.assertEqual(len(self.events(state, "stopped")), 1)
+        self.assertEqual(state["health"][2:], ["0", "0"])
+        self.assertGreater(int(state["persisted"].split()[11]), state["time"])
+        self.assertEqual(self.restarts(state), [])
 
     def test_manual_reset_rearms_budget(self):
         state, log = self.run_watchdog([{}] * 9 + [{"manual_reset": True}] + [{}] * 9,
