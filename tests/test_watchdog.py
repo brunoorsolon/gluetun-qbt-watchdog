@@ -421,6 +421,8 @@ class WatchdogTests(unittest.TestCase):
                                         env={"PATH": "/usr/bin:/bin", **setting})
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("FATAL:", result.stdout)
+                if "DOCKER_ENABLED" in setting:
+                    self.assertIn("DOCKER_ENABLED", result.stdout)
 
 
 if __name__ == "__main__":
