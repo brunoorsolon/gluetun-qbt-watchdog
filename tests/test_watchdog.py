@@ -4,19 +4,16 @@ import json
 import os
 from pathlib import Path
 import signal
-import socket
-import subprocess
 import sys
-import tempfile
 import time
-import unittest
-import urllib.error
-import urllib.request
 
 SCRIPT = Path(__file__).resolve().parents[1] / "gluetun-qbt-watchdog/gluetun-qbt-watchdog.sh"
 
 
 def request_restart(state, sample):
+    import urllib.error
+    import urllib.request
+
     for _ in range(sample.get("manual_restart", 1)):
         # The shell fixture uses virtual time; HTTP freshness needs a real timestamp.
         health_path = Path(os.environ["HEALTH_STATUS_FILE"])
@@ -45,18 +42,11 @@ def request_restart(state, sample):
 def fake_command(command, args):
     path = Path(os.environ["WATCHDOG_TEST_STATE"])
     state = json.loads(path.read_text())
+    state["time"] = int(path.with_name("clock").read_text())
     sample = state["samples"][max(0, state["index"] - 1)]
     output, code = "", 0
-    if command == "sleep":
-        state.setdefault("pid", os.getppid())
-        state["time"] += int(args[0])
-        request_at = state["samples"][0].get("manual_restart_at")
-        if request_at is not None and state["time"] >= request_at and not state.get("request_sent"):
-            request_restart(state, state["samples"][0])
-            state["request_sent"] = True
-    elif command == "cut":
-        assert args == ["-d.", "-f1", "/proc/uptime"]
-        output = str(state["time"])
+    if command == "request":
+        request_restart(state, state["samples"][0])
     elif command == "docker":
         state["events"].append(["docker", state["time"], args])
         if args[0] == "inspect":
@@ -80,7 +70,7 @@ def fake_command(command, args):
             if state["index"] == len(state["samples"]):
                 state["complete"] = True
                 path.write_text(json.dumps(state))
-                os.kill(state["pid"], signal.SIGTERM)
+                os.kill(os.getpgid(0), signal.SIGTERM)  # The watchdog shell leads its own session.
                 return
             sample = state["samples"][state["index"]]
             state["index"] += 1
@@ -129,22 +119,47 @@ def fake_command(command, args):
     sys.exit(code)
 
 
+if __name__ == "__main__" and sys.argv[1:2] == ["--fake"]:
+    # Fake commands run hundreds of times per suite; skip the test-runner imports below.
+    fake_command(sys.argv[2], sys.argv[3:])
+    sys.exit()
+
+import socket
+import subprocess
+import tempfile
+import unittest
+
+
 class WatchdogTests(unittest.TestCase):
     def run_watchdog(self, samples, root=None, **settings):
         if root is None:
             with tempfile.TemporaryDirectory(prefix="watchdog-test-") as directory:
                 return self.run_watchdog(samples, Path(directory), **settings)
         state_file = root / "fixture.json"
+        clock = root / "clock"
+        request_at = root / "request-at"
         previous = json.loads(state_file.read_text()) if state_file.exists() else {}
+        if not clock.exists():
+            clock.write_text("0")
         state_file.write_text(json.dumps({
-            "time": previous.get("time", 0), "index": 0, "qbt_port": previous.get("qbt_port", 6881),
-            "samples": samples, "events": [],
+            "index": 0, "qbt_port": previous.get("qbt_port", 6881), "samples": samples, "events": [],
         }))
-        for command in ("curl", "docker", "sleep", "cut"):
+        if "manual_restart_at" in samples[0]:
+            request_at.write_text(str(samples[0]["manual_restart_at"]))
+        fake = f'"{sys.executable}" "{Path(__file__).resolve()}" --fake'
+        launchers = {
+            "curl": f'exec {fake} curl "$@"',
+            "docker": f'exec {fake} docker "$@"',
+            # The watchdog reads and advances the clock every virtual second, so these stay in shell.
+            "cut": f'[ "$*" = "-d. -f1 /proc/uptime" ] || exit 99\nread -r now < "{clock}"\necho "$now"',
+            # A due request arrives at its own time, mid-sleep, so a late wake-up stays visible.
+            "sleep": f'read -r now < "{clock}"\nend=$((now + $1))\n'
+                     f'if [ -f "{request_at}" ] && [ "$end" -ge "$(cat "{request_at}")" ]; then\n'
+                     f'    mv "{request_at}" "{clock}"\n    {fake} request\nfi\necho "$end" > "{clock}"',
+        }
+        for command, body in launchers.items():
             launcher = root / command
-            launcher.write_text(
-                f'#!/bin/sh\nexec "{sys.executable}" "{Path(__file__).resolve()}" --fake {command} "$@"\n'
-            )
+            launcher.write_text(f"#!/bin/sh\n{body}\n")
             launcher.chmod(0o700)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -586,7 +601,4 @@ class WatchdogTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--fake":
-        fake_command(sys.argv[2], sys.argv[3:])
-    else:
-        unittest.main()
+    unittest.main()

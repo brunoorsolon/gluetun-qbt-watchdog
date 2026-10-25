@@ -27,7 +27,7 @@ class HealthEndpointTests(unittest.TestCase):
 
     def start_server(self, key, state_dir=None):
         self.server = health.make_server(("127.0.0.1", 0), self.path, 180, key, state_dir or self.directory.name)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, args=(0.01,), daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_port}/healthz"
 
