@@ -135,6 +135,8 @@ class WatchdogTests(unittest.TestCase):
         self.assertTrue(state.get("complete"))
         state["health"] = (root / "health").read_text().split()[1:]
         state["persisted"] = (root / "state/recovery.state").read_text()
+        if settings.get("DOCKER_ENABLED") == "false":
+            self.assertEqual(self.events(state, "docker"), [], "API-only mode must never invoke Docker")
         return state, stdout + stderr
 
     @staticmethod
@@ -251,6 +253,64 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("start API call failed", log)
         self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
 
+    def test_api_only_recovery_skips_docker_grace_and_disables_container_fallback(self):
+        state, log = self.run_watchdog(
+            [{}] * 9, DOCKER_ENABLED="false", RESTART_GLUETUN_CONTAINER="true",
+            PORT_MISS_THRESHOLD=1, MISSING_PORT_GRACE=60, MAX_VPN_RESTARTS=1,
+            GLUETUN_RECOVERY_GRACE=300,
+        )
+        self.assertEqual(self.events(state, "stopped"), [[90]])
+        self.assertEqual(self.events(state, "running"), [[95]])
+        self.assertEqual(state["health"][:2], ["unrecoverable", "port_missing_after_recovery"])
+        self.assertEqual(log.count("ERROR UNRECOVERABLE:"), 1)
+        self.assertEqual(log.count("API-only mode:"), 1)
+        # The post-restart grace must still run before the terminal latch.
+        state, _ = self.run_watchdog(
+            [{}] * 4, DOCKER_ENABLED="false", PORT_MISS_THRESHOLD=1,
+            MISSING_PORT_GRACE=60, MAX_VPN_RESTARTS=1, GLUETUN_RECOVERY_GRACE=300,
+        )
+        self.assertEqual(state["health"][0], "recovering")
+
+    def test_api_only_sync_and_cooldown_survive_process_restart(self):
+        with tempfile.TemporaryDirectory(prefix="watchdog-api-only-") as directory:
+            root = Path(directory)
+            settings = dict(DOCKER_ENABLED="false", PORT_MISS_THRESHOLD=1,
+                            MISSING_PORT_GRACE=60, GLUETUN_RECOVERY_GRACE=60,
+                            RESTART_COOLDOWN=43200)
+            state, _ = self.run_watchdog([{}, {}, {"port": 54128}], root, **settings)
+            self.assertEqual(self.events(state, "stopped"), [[90]])
+            self.assertEqual(state["qbt_port"], 54128)
+            self.assertEqual(state["health"][0], "healthy")
+            state, _ = self.run_watchdog([{}] * 8, root, **settings)
+            self.assertEqual(self.events(state, "stopped"), [])
+            self.assertEqual(state["health"][0], "recovering")
+
+    def test_api_only_ignores_persisted_docker_health_observation(self):
+        with tempfile.TemporaryDirectory(prefix="watchdog-api-only-") as directory:
+            root = Path(directory)
+            settings = dict(PORT_MISS_THRESHOLD=1, MISSING_PORT_GRACE=60,
+                            GLUETUN_RECOVERY_GRACE=900)
+            state, _ = self.run_watchdog([{"health": "unknown"}], root, **settings)
+            self.assertEqual(self.events(state, "stopped"), [])
+            state, _ = self.run_watchdog([{}], root, DOCKER_ENABLED="false", **settings)
+            self.assertEqual(len(self.events(state, "stopped")), 1)
+
+    def test_api_only_password_auth_never_uses_temporary_password(self):
+        for status, expected in ((200, "healthy"), (403, "unrecoverable")):
+            with self.subTest(status=status):
+                state, _ = self.run_watchdog(
+                    [{"port": 54128, "login_status": status}] * 3, DOCKER_ENABLED="false",
+                    QBT_API_KEY="", QBT_AUTH_MODE="password", QBT_PASS="configured-test",
+                    MISSING_PORT_GRACE=60,
+                )
+                self.assertEqual(state["health"][0], expected)
+                self.assertEqual(self.events(state, "stopped"), [])
+                self.assertFalse(state.get("password_updated"))
+                if status == 200:
+                    self.assertEqual(state["qbt_port"], 54128)
+                else:
+                    self.assertEqual(state["health"][1], "qbittorrent_auth_failed")
+
     def test_docker_permission_failure_becomes_one_terminal_alert(self):
         state, log = self.run_watchdog(
             [{"docker_exit": 1}] * 12, MAX_VPN_RESTARTS=1,
@@ -353,10 +413,12 @@ class WatchdogTests(unittest.TestCase):
             self.assertIn("Cannot persist recovery state", result.stdout)
 
     def test_invalid_configuration_fails_before_starting(self):
-        for value in ("0", "-1", "abc", "08", "1000000000"):
-            with self.subTest(value=value):
+        settings = [{"PORT_MISS_THRESHOLD": value} for value in ("0", "-1", "abc", "08", "1000000000")]
+        settings += [{"DOCKER_ENABLED": value} for value in ("", "0", "yes", "TRUE")]
+        for setting in settings:
+            with self.subTest(setting=setting):
                 result = subprocess.run(["sh", str(SCRIPT)], capture_output=True, text=True, timeout=2,
-                                        env={"PATH": "/usr/bin:/bin", "PORT_MISS_THRESHOLD": value})
+                                        env={"PATH": "/usr/bin:/bin", **setting})
                 self.assertEqual(result.returncode, 1)
                 self.assertIn("FATAL:", result.stdout)
 
