@@ -35,10 +35,12 @@ def make_server(address, path, stale_after):
             self.connection.settimeout(5)
 
         def do_GET(self):
-            if self.path != "/healthz":
+            if self.path not in ("/healthz", "/readyz"):
                 self.send_error(404)
                 return
             status, body = health_snapshot(path, stale_after)
+            if self.path == "/readyz" and body["status"] == "recovering":
+                status = 202
             data = (json.dumps(body) + "\n").encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
