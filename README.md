@@ -145,7 +145,7 @@ docker pull ghcr.io/brunoorsolon/gluetun-qbt-watchdog:latest
 You can also pin a release tag once releases are published:
 
 ```yaml
-image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:1.0.2
+image: ghcr.io/brunoorsolon/gluetun-qbt-watchdog:2.1.0
 ```
 
 ## Configuration
